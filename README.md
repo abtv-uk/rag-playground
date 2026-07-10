@@ -1,5 +1,7 @@
 # RAG Playground
 
+**Live demo → https://abtv-uk.github.io/rag-playground/**
+
 An interactive, single-screen playground for exploring how four retrieval-augmented generation (RAG) architectures answer the same question over the same document.
 
 Load a document (a scripted demo of *Attention Is All You Need*), watch it get indexed — pages split into chunks, chunks fly into a vector scatter, and (for Hybrid) a 3D knowledge graph draws itself — then ask a question and watch the query travel through a live, canvas-rendered pipeline diagram that lights up stage by stage while the answer streams into the output panel with a retrieval trace.

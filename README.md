@@ -59,6 +59,6 @@ React owns the state machine and DOM chrome; the renderer runs its own `requestA
 
 The retrieval itself is a scripted demo (no API keys, no backend): answers, sources and grading results are canned per architecture. The pipeline visualization, state machine and interactions are the real subject.
 
-## Design handoff
+## Provenance
 
-This app is a high-fidelity recreation of a design prototype produced with Claude Design. The original handoff bundle — including the self-contained HTML prototype you can open directly in a browser — lives in [`handoff/`](handoff/), with the spec in [`handoff/README.md`](handoff/README.md).
+This app is a high-fidelity recreation of a design prototype produced with Claude Design, ported to Next.js from a single-file HTML/canvas handoff.

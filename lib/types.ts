@@ -51,4 +51,5 @@ export interface PlaygroundState {
   doc: LoadedDocInfo | null;
   loading: boolean;
   loadError: string;
+  suggestions: string[];
 }

@@ -1,7 +1,6 @@
 "use client";
 
 import type { FormEvent } from "react";
-import { SUGGESTIONS } from "@/lib/constants";
 import type { PlaygroundActions } from "@/hooks/usePlayground";
 import type { PlaygroundState } from "@/lib/types";
 
@@ -71,7 +70,7 @@ export default function QueryBar({
         >
           TRY
         </span>
-        {SUGGESTIONS.map((s) => (
+        {state.suggestions.map((s) => (
           <button
             key={s}
             onClick={() => actions.pickSuggestion(s)}

@@ -14,6 +14,7 @@ import {
   INDEX_MS,
   STEP_MS,
   STREAM_WORD_MS,
+  SUGGESTIONS,
   buildSources,
 } from "@/lib/constants";
 import {
@@ -23,7 +24,11 @@ import {
   type LoadedDoc,
 } from "@/lib/document";
 import { PipelineRenderer } from "@/lib/renderer";
-import { buildRealSources, retrieve } from "@/lib/retrieval";
+import {
+  buildRealSources,
+  generateSuggestions,
+  retrieve,
+} from "@/lib/retrieval";
 import { applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
 import { steps } from "@/lib/steps";
 import type { PlaygroundState, RagId } from "@/lib/types";
@@ -42,6 +47,7 @@ const INITIAL: PlaygroundState = {
   doc: null,
   loading: false,
   loadError: "",
+  suggestions: SUGGESTIONS,
 };
 
 export interface PlaygroundActions {
@@ -128,7 +134,13 @@ export function usePlayground() {
     (doc: LoadedDoc) => {
       renderer.view.scene = doc.isSample ? sampleScene() : buildScene(doc);
       renderer.resetGraphInteraction();
-      set({ doc, loading: false, loadError: "" });
+      const generated = doc.isSample ? [] : generateSuggestions(doc.chunks);
+      set({
+        doc,
+        loading: false,
+        loadError: "",
+        suggestions: generated.length ? generated : SUGGESTIONS,
+      });
       runIndex();
     },
     [renderer, runIndex, set],
@@ -226,6 +238,7 @@ export function usePlayground() {
         doc: null,
         loading: false,
         loadError: "",
+        suggestions: SUGGESTIONS,
         phase: "empty",
       });
     },

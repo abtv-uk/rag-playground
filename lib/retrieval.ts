@@ -120,6 +120,7 @@ function extractAnswer(top: ScoredChunk[], qTerms: string[]): string {
 
 export interface ExtractedEntity {
   label: string;
+  full: string;
   count: number;
   chunkIds: Set<number>;
   p: [number, number, number];
@@ -170,6 +171,7 @@ export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
     const th = i * 2.39996;
     return {
       label: label.length > 16 ? label.slice(0, 15) + "…" : label,
+      full: label,
       count: v.count,
       chunkIds: v.chunkIds,
       p: [Math.cos(th) * r, y * 0.85, Math.sin(th) * r] as [number, number, number],
@@ -293,4 +295,42 @@ export function buildRealSources(
     return cards.concat(top.slice(0, rejectedRow ? 2 : 3).map(chunkCard));
   }
   return top.slice(0, 3).map(chunkCard);
+}
+
+// ---------- suggested questions for uploaded documents ----------
+
+export function generateSuggestions(chunks: DocChunk[]): string[] {
+  const graph = extractEntityGraph(chunks);
+  const full = (i: number) => graph.nodes[i]?.full;
+  const out: string[] = [];
+  if (full(0)) out.push(`What is ${full(0)}?`);
+  const edge = graph.edges.find(
+    (e) => full(e.a) && full(e.b) && e.a !== e.b,
+  );
+  if (edge) out.push(`How does ${full(edge.a)} relate to ${full(edge.b)}?`);
+  const third = graph.nodes.find(
+    (n, i) => n.full && i !== 0 && i !== edge?.a && i !== edge?.b,
+  );
+  if (third) out.push(`What does it say about ${third.full}?`);
+  if (out.length < 3) {
+    // keyword fallback for documents with few capitalized entities
+    const freq = new Map<string, number>();
+    for (const c of chunks)
+      for (const w of tokenize(c.text))
+        freq.set(w, (freq.get(w) || 0) + 1);
+    const kws = [...freq.entries()]
+      .filter(([w]) => w.length > 3)
+      .sort((a, b) => b[1] - a[1])
+      .map(([w]) => w);
+    for (const kw of kws) {
+      if (out.length >= 3) break;
+      if (out.some((q) => q.toLowerCase().includes(kw))) continue;
+      out.push(
+        out.length === 0
+          ? `What is ${kw}?`
+          : `What does it say about ${kw}?`,
+      );
+    }
+  }
+  return out.slice(0, 3);
 }

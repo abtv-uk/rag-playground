@@ -106,6 +106,11 @@ export default function CanvasStage({
               alignItems: "center",
               justifyContent: "center",
               zIndex: 3,
+              // frost the idle pipeline so the focus is on loading a document
+              background:
+                "color-mix(in srgb, var(--bg) 55%, transparent)",
+              backdropFilter: "blur(7px)",
+              WebkitBackdropFilter: "blur(7px)",
             }}
           >
             <div style={{ width: 380, textAlign: "center" }}>

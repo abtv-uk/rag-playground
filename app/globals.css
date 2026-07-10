@@ -93,6 +93,20 @@ body {
   animation: rgshim 1.2s linear infinite;
 }
 
+.rg-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+  z-index: 6;
+  transition: background 0.15s;
+}
+.rg-handle:hover,
+.rg-handle.active {
+  background: var(--hair);
+}
+
 input::placeholder {
   color: var(--faint);
 }

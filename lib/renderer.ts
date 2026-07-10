@@ -3,14 +3,7 @@
 // per-architecture diagram layout. React feeds it a mutable `view` each render.
 
 import { ACCENTS, INDEX_MS, REJECT, STEP_MS } from "./constants";
-import {
-  CHUNKS,
-  GEDGES,
-  GNODES,
-  G_ACTIVE,
-  G_NEIGHBORS,
-  REL_NAIVE,
-} from "./data";
+import { sampleScene, type SceneData } from "./scene";
 import { steps } from "./steps";
 import type { Phase, QueryStep, RagId } from "./types";
 
@@ -23,6 +16,7 @@ export interface RendererView {
   queryStart: number;
   querySteps: QueryStep[] | null;
   reducedMotion: boolean;
+  scene: SceneData;
 }
 
 interface Pt {
@@ -127,6 +121,7 @@ export class PipelineRenderer {
     queryStart: 0,
     querySteps: null,
     reducedMotion: false,
+    scene: sampleScene(),
   };
 
   private cv: HTMLCanvasElement | null = null;
@@ -265,6 +260,7 @@ export class PipelineRenderer {
     const W = this.W;
     const H = this.H;
     const rag = this.view.rag;
+    const vSub = this.view.scene.chunkCount + " chunks · 768-d";
     const pt = (x: number, y: number): Pt => ({ x, y });
     const N = (
       id: string,
@@ -306,7 +302,7 @@ export class PipelineRenderer {
       add(N("qn", 0.085, 0.42, "USER QUERY", "query", { labelSide: "top" }));
       add(N("embed", 0.26, 0.22, "EMBEDDING", "embed", { sub: "768-d" }));
       add(N("doc", 0.585, 0.07, "DATA SOURCE", "doc", { labelSide: "right" }));
-      panels.vector = RECT(0.4, 0.17, 0.775, 0.6, "VECTOR DB", "64 chunks · 768-d");
+      panels.vector = RECT(0.4, 0.17, 0.775, 0.6, "VECTOR DB", vSub);
       add(N("prompt", 0.5, 0.82, "PROMPT TEMPLATE", "prompt", { sub: "ctx #14 #22 + Q" }));
       add(N("llm", 0.7, 0.82, "LLM", "llm", { sub: "generate" }));
       const n = nodes;
@@ -321,7 +317,7 @@ export class PipelineRenderer {
     } else if (rag === "hybrid" || rag === "corrective") {
       add(N("qn", 0.075, 0.4, "USER QUERY", "query", { labelSide: "top" }));
       add(N("embed", 0.225, 0.2, "EMBEDDING", "embed", { sub: "768-d" }));
-      panels.vector = RECT(0.325, 0.1, 0.625, 0.555, "VECTOR DB", rag === "hybrid" ? "context 1" : "64 chunks · 768-d");
+      panels.vector = RECT(0.325, 0.1, 0.625, 0.555, "VECTOR DB", rag === "hybrid" ? "context 1" : vSub);
       panels.sec =
         rag === "hybrid"
           ? RECT(0.685, 0.1, 0.965, 0.555, "KNOWLEDGE GRAPH", "context 2 · hover & click")
@@ -349,7 +345,7 @@ export class PipelineRenderer {
     } else {
       add(N("qn", 0.075, 0.46, "USER QUERY", "query", { labelSide: "top" }));
       add(Object.assign(N("agent", 0.42, 0.46, "AGENT", "agent"), { w: 118, h: 50, kind: "agent" }));
-      panels.vector = RECT(0.055, 0.6, 0.375, 0.9, "VECTOR DB", "64 chunks · 768-d");
+      panels.vector = RECT(0.055, 0.6, 0.375, 0.9, "VECTOR DB", vSub);
       add(N("llm", 0.615, 0.82, "LLM", "llm", { sub: "generate" }));
       const n = nodes;
       const v = panels.vector;
@@ -602,11 +598,11 @@ export class PipelineRenderer {
   ) {
     const T = this.T;
     const src = o.src || { x: p.x0 + (p.x1 - p.x0) * 0.5, y: p.y0 - 40 };
-    const rel = new Set(o.highlightOn ? REL_NAIVE : []);
+    const rel = new Set(o.highlightOn ? this.view.scene.rel : []);
     ctx.save();
     this.rr(ctx, p.x0 + 1, p.y0 + 1, p.x1 - p.x0 - 2, p.y1 - p.y0 - 2, 13);
     ctx.clip();
-    CHUNKS.forEach((c) => {
+    this.view.scene.dots.forEach((c) => {
       const local = Math.max(0, Math.min(1, (settle - c.delay) / (1 - c.delay || 1)));
       const t = this.easeOut(local);
       const tp = this.pn(p, c.nx, c.ny);
@@ -657,7 +653,8 @@ export class PipelineRenderer {
     if ((anim || this.hoverNode >= 0) && !this.view.reducedMotion)
       this.rot += dt * rotSpeed;
     const ang = this.rot;
-    const proj = GNODES.map((nd, i) => {
+    const { gnodes, gedges, gActive, gnbr } = this.view.scene;
+    const proj = gnodes.map((nd, i) => {
       const [x, y, z] = nd.p;
       const xr = x * Math.cos(ang) + z * Math.sin(ang);
       const zr = -x * Math.sin(ang) + z * Math.cos(ang);
@@ -665,12 +662,12 @@ export class PipelineRenderer {
       const sc = f / (f - zr);
       return { i, x: cx + xr * radX * sc, y: cy + y * radY * sc, z: zr, sc, depth: (zr + 1) / 2 };
     });
-    const activeN = new Set(active ? G_ACTIVE : []);
-    const nbr = interact >= 0 ? G_NEIGHBORS[interact] : null;
-    GEDGES.forEach((e, ei) => {
+    const activeN = new Set(active ? gActive : []);
+    const nbr = interact >= 0 ? gnbr[interact] : null;
+    gedges.forEach((e, ei) => {
       const a = proj[e.a];
       const b = proj[e.b];
-      const grow = Math.max(0, Math.min(1, (app - (ei / GEDGES.length) * 0.5) / 0.5));
+      const grow = Math.max(0, Math.min(1, (app - (ei / gedges.length) * 0.5) / 0.5));
       if (grow <= 0) return;
       const mx = a.x + (b.x - a.x) * grow;
       const my = a.y + (b.y - a.y) * grow;
@@ -702,8 +699,8 @@ export class PipelineRenderer {
       .sort((a, b) => a.z - b.z)
       .forEach((q) => {
         const i = q.i;
-        const nd = GNODES[i];
-        const scale = Math.max(0, Math.min(1, (app - (i / GNODES.length) * 0.4) / 0.5));
+        const nd = gnodes[i];
+        const scale = Math.max(0, Math.min(1, (app - (i / gnodes.length) * 0.4) / 0.5));
         if (scale <= 0) return;
         const isAct = activeN.has(i);
         const foc = i === interact;
@@ -757,7 +754,7 @@ export class PipelineRenderer {
     locked: boolean,
   ) {
     const T = this.T;
-    const nd = GNODES[i];
+    const nd = this.view.scene.gnodes[i];
     const tw = 180;
     const lines = this.wrap(ctx, nd.desc, tw - 24);
     const th = 44 + lines.length * 13;
@@ -785,7 +782,7 @@ export class PipelineRenderer {
     ctx.font = '500 8px "JetBrains Mono",monospace';
     ctx.fillStyle = A;
     ctx.fillText(
-      G_NEIGHBORS[i].size + " LINKS · ENTITY" + (locked ? " · PINNED" : ""),
+      this.view.scene.gnbr[i].size + " LINKS · ENTITY" + (locked ? " · PINNED" : ""),
       tx + 13,
       ty + 27,
     );
@@ -1381,7 +1378,7 @@ export class PipelineRenderer {
     ctx.fillStyle = A;
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillText("attention.pdf", dc.x, dc.y + h * 0.5 * appear + 7);
+    ctx.fillText(this.view.scene.docLabel, dc.x, dc.y + h * 0.5 * appear + 7);
     ctx.restore();
   }
 }

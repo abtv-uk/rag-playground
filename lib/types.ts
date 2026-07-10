@@ -29,6 +29,14 @@ export interface QueryStep {
   stream?: 1;
 }
 
+export interface LoadedDocInfo {
+  name: string;
+  sizeLabel: string;
+  pages: number;
+  chunks: { id: number; page: number; text: string }[];
+  isSample: boolean;
+}
+
 export interface PlaygroundState {
   rag: RagId;
   phase: Phase;
@@ -40,4 +48,7 @@ export interface PlaygroundState {
   sources: Source[];
   sourcesVisible: boolean;
   idxStage: number;
+  doc: LoadedDocInfo | null;
+  loading: boolean;
+  loadError: string;
 }

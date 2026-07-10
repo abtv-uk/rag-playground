@@ -10,9 +10,17 @@ const MONO = "'JetBrains Mono',monospace";
 export default function OutputPanel({
   state,
   accent,
+  width,
+  dragging,
+  onHandleDown,
+  onHandleReset,
 }: {
   state: PlaygroundState;
   accent: string;
+  width: number;
+  dragging: boolean;
+  onHandleDown: (e: React.PointerEvent) => void;
+  onHandleReset: () => void;
 }) {
   const isEmpty = state.phase === "empty";
   const isIndexing = state.phase === "indexing";
@@ -27,8 +35,12 @@ export default function OutputPanel({
   const showSources = state.sourcesVisible && state.sources.length > 0;
 
   return (
-    <div
+    <motion.div
+      initial={false}
+      animate={{ width }}
+      transition={dragging ? { duration: 0 } : { duration: 0.25, ease: "easeInOut" }}
       style={{
+        position: "relative",
         gridColumn: 3,
         gridRow: "2 / 4",
         borderLeft: "1px solid var(--hair)",
@@ -40,6 +52,13 @@ export default function OutputPanel({
         zIndex: 4,
       }}
     >
+      <div
+        className={"rg-handle" + (dragging ? " active" : "")}
+        style={{ left: 0 }}
+        onPointerDown={onHandleDown}
+        onDoubleClick={onHandleReset}
+        title="drag to resize · double-click to reset"
+      />
       <div
         style={{
           display: "flex",
@@ -290,6 +309,6 @@ export default function OutputPanel({
           </div>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }

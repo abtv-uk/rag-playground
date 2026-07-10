@@ -62,10 +62,14 @@ export const QUERY_CAPTIONS: Record<RagId, string> = {
   agentic: "QUERY · agent plans → loops retrieval → calls tools → generate",
 };
 
-export function indexCaptions(rag: RagId): string[] {
+export function indexCaptions(
+  rag: RagId,
+  pages = 15,
+  chunks = 64,
+): string[] {
   return [
-    "INDEXING · separating 15 pages",
-    "INDEXING · splitting into 64 chunks",
+    `INDEXING · separating ${pages} page${pages === 1 ? "" : "s"}`,
+    `INDEXING · splitting into ${chunks} chunks`,
     "INDEXING · embedding chunks → 768-d",
     rag === "hybrid"
       ? "INDEXING · extracting entities → graph"

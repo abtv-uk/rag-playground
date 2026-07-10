@@ -3,6 +3,10 @@
 // State machine for the playground: empty → indexing → ready → querying →
 // answered. Mirrors state into the canvas renderer's mutable view so the rAF
 // loop reads fresh values without re-rendering React each frame.
+//
+// Documents: the bundled sample keeps the scripted demo (canned answers,
+// sources and scene); uploaded files / scraped URLs get real chunking,
+// lexical retrieval and extractive answers.
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import {
@@ -12,7 +16,15 @@ import {
   STREAM_WORD_MS,
   buildSources,
 } from "@/lib/constants";
+import {
+  SAMPLE_DOC,
+  fetchUrl,
+  parseFile,
+  type LoadedDoc,
+} from "@/lib/document";
 import { PipelineRenderer } from "@/lib/renderer";
+import { buildRealSources, retrieve } from "@/lib/retrieval";
+import { applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
 import { steps } from "@/lib/steps";
 import type { PlaygroundState, RagId } from "@/lib/types";
 
@@ -27,14 +39,20 @@ const INITIAL: PlaygroundState = {
   sources: [],
   sourcesVisible: false,
   idxStage: 0,
+  doc: null,
+  loading: false,
+  loadError: "",
 };
 
 export interface PlaygroundActions {
   loadSample: () => void;
+  loadFile: (file: File) => void;
+  loadUrl: (url: string) => void;
   reindex: () => void;
   clear: () => void;
   toggleTheme: () => void;
   toggleCollapse: () => void;
+  setExpanded: (v: boolean) => void;
   setQuery: (q: string) => void;
   submit: () => void;
   selectTab: (id: RagId) => void;
@@ -50,6 +68,7 @@ export function usePlayground() {
 
   const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const lastQueryRef = useRef("");
+  const loadSeqRef = useRef(0);
 
   const set = useCallback(
     (patch: Partial<PlaygroundState>) => {
@@ -105,9 +124,37 @@ export function usePlayground() {
     after(INDEX_MS, () => set({ phase: "ready" }));
   }, [after, clearTimers, renderer, set]);
 
+  const adoptDoc = useCallback(
+    (doc: LoadedDoc) => {
+      renderer.view.scene = doc.isSample ? sampleScene() : buildScene(doc);
+      renderer.resetGraphInteraction();
+      set({ doc, loading: false, loadError: "" });
+      runIndex();
+    },
+    [renderer, runIndex, set],
+  );
+
+  const loadAsync = useCallback(
+    (job: Promise<LoadedDoc>) => {
+      const seq = ++loadSeqRef.current;
+      set({ loading: true, loadError: "" });
+      job.then(
+        (doc) => {
+          if (seq === loadSeqRef.current) adoptDoc(doc);
+        },
+        (err: unknown) => {
+          if (seq !== loadSeqRef.current) return;
+          const msg = err instanceof Error ? err.message : String(err);
+          set({ loading: false, loadError: msg });
+        },
+      );
+    },
+    [adoptDoc, set],
+  );
+
   const streamAnswer = useCallback(
-    (rag: RagId) => {
-      const words = ANSWERS[rag].split(" ");
+    (text: string) => {
+      const words = text.split(" ");
       set({ answer: "", streaming: true });
       let i = 0;
       const tick = () => {
@@ -125,10 +172,23 @@ export function usePlayground() {
     (q: string) => {
       clearTimers();
       lastQueryRef.current = q;
-      const rag = stateRef.current.rag;
+      const { rag, doc } = stateRef.current;
       const qsteps = steps(rag);
       renderer.view.querySteps = qsteps;
       renderer.view.queryStart = performance.now();
+
+      let answer: string;
+      let sources;
+      if (doc && !doc.isSample) {
+        const res = retrieve(doc.chunks, q);
+        applyQueryToScene(renderer.view.scene, res);
+        answer = res.answer;
+        sources = buildRealSources(rag, res, renderer.view.scene);
+      } else {
+        answer = ANSWERS[rag];
+        sources = buildSources(rag);
+      }
+
       set({
         query: q,
         answer: "",
@@ -139,30 +199,41 @@ export function usePlayground() {
       });
       const streamIdx = qsteps.findIndex((s) => s.stream);
       after(STEP_MS * (streamIdx - 0.4), () =>
-        set({ sources: buildSources(rag), sourcesVisible: true }),
+        set({ sources, sourcesVisible: true }),
       );
-      after(STEP_MS * streamIdx, () => streamAnswer(rag));
+      after(STEP_MS * streamIdx, () => streamAnswer(answer));
     },
     [after, clearTimers, renderer, set, streamAnswer],
   );
 
   const actions: PlaygroundActions = {
-    loadSample: runIndex,
+    loadSample: () => adoptDoc(SAMPLE_DOC),
+    loadFile: (file) => loadAsync(parseFile(file)),
+    loadUrl: (url) => loadAsync(fetchUrl(url)),
     reindex: runIndex,
     clear: () => {
       clearTimers();
+      loadSeqRef.current++;
       lastQueryRef.current = "";
+      renderer.view.scene = sampleScene();
+      renderer.resetGraphInteraction();
       set({
         query: "",
         answer: "",
         sources: [],
         sourcesVisible: false,
         streaming: false,
+        doc: null,
+        loading: false,
+        loadError: "",
         phase: "empty",
       });
     },
     toggleTheme: () => set({ dark: !stateRef.current.dark }),
     toggleCollapse: () => set({ expanded: !stateRef.current.expanded }),
+    setExpanded: (v) => {
+      if (v !== stateRef.current.expanded) set({ expanded: v });
+    },
     setQuery: (q) => set({ query: q }),
     submit: () => {
       const s = stateRef.current;

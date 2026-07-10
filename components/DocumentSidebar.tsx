@@ -12,23 +12,39 @@ export default function DocumentSidebar({
   state,
   accent,
   actions,
+  width,
+  entityCount,
+  dragging,
+  onHandleDown,
+  onHandleReset,
 }: {
   state: PlaygroundState;
   accent: string;
   actions: PlaygroundActions;
+  width: number;
+  entityCount: number;
+  dragging: boolean;
+  onHandleDown: (e: React.PointerEvent) => void;
+  onHandleReset: () => void;
 }) {
   const hasDoc = state.phase !== "empty";
   const showDocPanel = state.expanded && hasDoc;
-  const pageThumbs = Array.from({ length: 8 }, (_, i) =>
-    String(i + 1).padStart(2, "0"),
+  const doc = state.doc;
+  const pages = doc?.pages ?? 15;
+  const chunkCount = doc ? (doc.isSample ? 64 : doc.chunks.length) : 64;
+  const pageThumbs = Array.from(
+    { length: Math.max(1, Math.min(pages, 8)) },
+    (_, i) => String(i + 1).padStart(2, "0"),
   );
+  const isPdf = !doc || /\.pdf$/i.test(doc.name);
 
   return (
     <motion.div
       initial={false}
-      animate={{ width: state.expanded ? 250 : 62 }}
-      transition={{ duration: 0.25, ease: "easeInOut" }}
+      animate={{ width }}
+      transition={dragging ? { duration: 0 } : { duration: 0.25, ease: "easeInOut" }}
       style={{
+        position: "relative",
         gridColumn: 1,
         gridRow: "2 / 4",
         borderRight: "1px solid var(--hair)",
@@ -88,7 +104,8 @@ export default function DocumentSidebar({
             flexDirection: "column",
             gap: 14,
             overflowY: "auto",
-            width: 250,
+            width: "100%",
+            minWidth: 222,
           }}
         >
           <div
@@ -129,7 +146,7 @@ export default function DocumentSidebar({
                     borderRadius: 2,
                   }}
                 >
-                  PDF
+                  {isPdf ? "PDF" : "TXT"}
                 </div>
               </div>
               <div style={{ minWidth: 0, flex: 1 }}>
@@ -143,10 +160,10 @@ export default function DocumentSidebar({
                     wordBreak: "break-all",
                   }}
                 >
-                  attention-is-all-you-need.pdf
+                  {doc?.name ?? ""}
                 </div>
                 <div style={{ fontFamily: MONO, fontSize: 10, color: "var(--sub2)", marginTop: 5 }}>
-                  312 KB · arXiv:1706.03762
+                  {doc?.sizeLabel ?? ""}
                 </div>
               </div>
             </div>
@@ -156,7 +173,7 @@ export default function DocumentSidebar({
                   CHUNKS
                 </div>
                 <div style={{ fontFamily: MONO, fontSize: 15, fontWeight: 600, color: "var(--ink)", marginTop: 2 }}>
-                  64
+                  {chunkCount}
                 </div>
               </div>
               <div style={{ flex: 1, padding: "9px 12px" }}>
@@ -164,7 +181,7 @@ export default function DocumentSidebar({
                   ENTITIES
                 </div>
                 <div style={{ fontFamily: MONO, fontSize: 15, fontWeight: 600, color: accent, marginTop: 2 }}>
-                  {state.rag === "hybrid" ? "11" : "—"}
+                  {state.rag === "hybrid" && entityCount > 0 ? entityCount : "—"}
                 </div>
               </div>
             </div>
@@ -180,7 +197,7 @@ export default function DocumentSidebar({
                 marginBottom: 8,
               }}
             >
-              PAGES · 15
+              PAGES · {pages}
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 7 }}>
               {pageThumbs.map((p) => (
@@ -323,6 +340,14 @@ export default function DocumentSidebar({
           {state.expanded && <span>{state.dark ? "Light mode" : "Dark mode"}</span>}
         </button>
       </div>
+
+      <div
+        className={"rg-handle" + (dragging ? " active" : "")}
+        style={{ right: 0 }}
+        onPointerDown={onHandleDown}
+        onDoubleClick={onHandleReset}
+        title="drag to resize · double-click to reset"
+      />
     </motion.div>
   );
 }

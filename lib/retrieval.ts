@@ -1,5 +1,11 @@
-// Lexical (TF-IDF-style) retrieval over uploaded documents, extractive
-// answers, and entity/co-occurrence graph extraction for the Hybrid tab.
+// Retrieval over uploaded documents. Four genuinely different strategies
+// share one lexical (TF-IDF-style) scoring core:
+//   basic      — single pass, top-k
+//   hybrid     — lexical pass merged with an entity-graph boost
+//   corrective — grade top chunks, reject low scores, re-retrieve via PRF
+//   agentic    — two-pass loop: retrieve, refine the query (PRF), retrieve again
+// Plus: extractive answers, entity/co-occurrence graph extraction, trace-card
+// builders, and generated suggestions.
 
 import { ACCENTS } from "./constants";
 import type { DocChunk } from "./document";
@@ -29,44 +35,227 @@ export interface ScoredChunk {
 }
 
 export interface RetrievalResult {
-  ranked: ScoredChunk[]; // all chunks with score > 0, best first
-  top: ScoredChunk[]; // top 6
+  ranked: ScoredChunk[]; // final ranking, best first
+  top: ScoredChunk[]; // alias of finalTop (top 6)
   answer: string;
   queryTerms: string[];
+  initialTop: ScoredChunk[]; // pass-1 result (drives first-phase visuals)
+  finalTop: ScoredChunk[]; // what the answer is actually built from
+  rejected?: ScoredChunk[]; // corrective: graded-out chunks
+  replacements?: ScoredChunk[]; // corrective: chunks found by re-retrieval
+  refinedTerms?: string[]; // agentic: terms actually added in pass 2
+  graphBoosted?: number[]; // hybrid: entity indices that boosted retrieval
+  boostedChunkIds?: Set<number>; // hybrid: chunks whose rank the graph raised
 }
 
-export function retrieve(chunks: DocChunk[], query: string): RetrievalResult {
-  const qTerms = [...new Set(tokenize(query))];
+export const PASS_THRESHOLD = 0.45;
+
+// ---------- shared scoring core ----------
+
+function scoreChunks(chunks: DocChunk[], terms: string[]): ScoredChunk[] {
   const N = chunks.length;
   const tokens = chunks.map((c) => tokenize(c.text));
   const df = new Map<string, number>();
-  for (const q of qTerms) {
+  for (const q of terms) {
     let d = 0;
     for (const t of tokens) if (t.includes(q)) d++;
     df.set(q, d);
   }
   const idf = (q: string) => Math.log(1 + N / (1 + (df.get(q) || 0)));
-  const scored = chunks.map((chunk, i) => {
-    const t = tokens[i];
-    let raw = 0;
-    for (const q of qTerms) {
-      const tf = t.filter((w) => w === q || w.startsWith(q)).length;
-      if (tf) raw += (1 + Math.log(tf)) * idf(q);
-    }
-    raw /= Math.sqrt(t.length || 1);
-    return { chunk, raw, score: 0 };
-  });
-  const ranked = scored.filter((s) => s.raw > 0).sort((a, b) => b.raw - a.raw);
+  return chunks
+    .map((chunk, i) => {
+      const t = tokens[i];
+      let raw = 0;
+      for (const q of terms) {
+        const tf = t.filter((w) => w === q || w.startsWith(q)).length;
+        if (tf) raw += (1 + Math.log(tf)) * idf(q);
+      }
+      raw /= Math.sqrt(t.length || 1);
+      return { chunk, raw, score: 0 };
+    })
+    .filter((s) => s.raw > 0)
+    .sort((a, b) => b.raw - a.raw);
+}
+
+/** Normalize scores in place against the list's own maximum. */
+function normalize(ranked: ScoredChunk[]): ScoredChunk[] {
   const max = ranked[0]?.raw || 1;
   ranked.forEach((s) => (s.score = (s.raw / max) * 0.95));
-  const top = ranked.slice(0, 6);
+  return ranked;
+}
+
+/** Pseudo-relevance feedback: terms frequent in the trusted chunks but rare
+ *  in the corpus (tf·idf), so boilerplate tokens (URLs, site chrome) that
+ *  appear everywhere don't win. */
+function prfTerms(
+  from: ScoredChunk[],
+  qTerms: string[],
+  n: number,
+  allChunks: DocChunk[],
+): string[] {
+  const known = new Set(qTerms);
+  const freq = new Map<string, number>();
+  for (const s of from) {
+    for (const w of tokenize(s.chunk.text)) {
+      if (known.has(w) || w.length <= 3) continue;
+      freq.set(w, (freq.get(w) || 0) + 1);
+    }
+  }
+  const N = allChunks.length || 1;
+  const scored = [...freq.entries()]
+    .filter(([, c]) => c >= 2)
+    .map(([w, c]) => {
+      let df = 0;
+      for (const ch of allChunks) if (ch.text.toLowerCase().includes(w)) df++;
+      return { w, weight: c * Math.log(N / (1 + df)) };
+    })
+    .filter((t) => t.weight > 0)
+    .sort((a, b) => b.weight - a.weight);
+  return scored.slice(0, n).map((t) => t.w);
+}
+
+function finish(
+  ranked: ScoredChunk[],
+  qTerms: string[],
+  extras: Partial<RetrievalResult> & { initialTop: ScoredChunk[] },
+): RetrievalResult {
+  normalize(ranked);
+  const finalTop = extras.finalTop ?? ranked.slice(0, 6);
   return {
     ranked,
-    top,
-    answer: extractAnswer(top.slice(0, 3), qTerms),
+    top: finalTop,
+    answer: extractAnswer(finalTop.slice(0, 3), qTerms),
     queryTerms: qTerms,
+    finalTop,
+    ...extras,
   };
 }
+
+// ---------- the four strategies ----------
+
+export function retrieveBasic(
+  chunks: DocChunk[],
+  query: string,
+): RetrievalResult {
+  const qTerms = [...new Set(tokenize(query))];
+  const ranked = scoreChunks(chunks, qTerms);
+  const initialTop = ranked.slice(0, 6);
+  return finish(ranked, qTerms, { initialTop });
+}
+
+export interface GraphForRetrieval {
+  nodes: { full?: string; label: string; chunkIds?: Set<number> }[];
+  neighbors: Record<number, Set<number>>;
+}
+
+export function retrieveHybrid(
+  chunks: DocChunk[],
+  query: string,
+  graph: GraphForRetrieval,
+): RetrievalResult {
+  const qTerms = [...new Set(tokenize(query))];
+  const lexical = scoreChunks(chunks, qTerms);
+  const initialTop = normalize(lexical.map((s) => ({ ...s }))).slice(0, 6);
+
+  // graph side: entities whose label matches a query term, plus 1-hop neighbors
+  const matched = new Set<number>();
+  graph.nodes.forEach((n, i) => {
+    const terms = tokenize(n.full || n.label);
+    if (terms.some((t) => qTerms.some((q) => t === q || t.startsWith(q))))
+      matched.add(i);
+  });
+  const active = new Set(matched);
+  for (const i of matched)
+    for (const j of graph.neighbors[i] || []) active.add(j);
+
+  const boostChunkIds = new Set<number>();
+  for (const i of active)
+    for (const id of graph.nodes[i].chunkIds || []) boostChunkIds.add(id);
+
+  const maxRaw = lexical[0]?.raw || 1;
+  const byId = new Map(lexical.map((s) => [s.chunk.id, s]));
+  // boost lexical hits; graph-only chunks enter the ranking at the boost floor
+  for (const id of boostChunkIds) {
+    const hit = byId.get(id);
+    if (hit) hit.raw += 0.35 * maxRaw;
+    else {
+      const chunk = chunks.find((c) => c.id === id);
+      if (chunk) lexical.push({ chunk, raw: 0.35 * maxRaw, score: 0 });
+    }
+  }
+  lexical.sort((a, b) => b.raw - a.raw);
+  const finalTop = normalize(lexical).slice(0, 6);
+  return {
+    ...finish(lexical, qTerms, { initialTop, finalTop }),
+    graphBoosted: [...active].slice(0, 6),
+    boostedChunkIds: boostChunkIds,
+  };
+}
+
+export function retrieveCorrective(
+  chunks: DocChunk[],
+  query: string,
+): RetrievalResult {
+  const qTerms = [...new Set(tokenize(query))];
+  const ranked = normalize(scoreChunks(chunks, qTerms));
+  const initialTop = ranked.slice(0, 6).map((s) => ({ ...s }));
+  const graded = ranked.slice(0, 5);
+  const rejected = graded.filter((s) => s.score < PASS_THRESHOLD);
+  const passing = graded.filter((s) => s.score >= PASS_THRESHOLD);
+  if (!rejected.length) {
+    return finish(ranked, qTerms, {
+      initialTop,
+      finalTop: ranked.slice(0, 6),
+      rejected: [],
+      replacements: [],
+    });
+  }
+  // re-retrieve with query expanded by terms from the chunks that passed
+  const trusted = passing.length ? passing : ranked.slice(0, 2);
+  const expansion = prfTerms(trusted, qTerms, 3, chunks);
+  const secondPass = scoreChunks(chunks, [...qTerms, ...expansion]);
+  const excluded = new Set(graded.map((s) => s.chunk.id));
+  const replacements = secondPass
+    .filter((s) => !excluded.has(s.chunk.id))
+    .slice(0, Math.max(rejected.length, 1));
+  const merged = [...passing, ...replacements].sort((a, b) => b.raw - a.raw);
+  const finalTop = normalize(merged).slice(0, 6);
+  return finish([...merged], qTerms, {
+    initialTop,
+    finalTop,
+    rejected,
+    replacements,
+  });
+}
+
+export function retrieveAgentic(
+  chunks: DocChunk[],
+  query: string,
+): RetrievalResult {
+  const qTerms = [...new Set(tokenize(query))];
+  const pass1 = normalize(scoreChunks(chunks, qTerms));
+  const initialTop = pass1.slice(0, 6).map((s) => ({ ...s }));
+  const refinedTerms = prfTerms(pass1.slice(0, 2), qTerms, 3, chunks);
+  if (!refinedTerms.length) {
+    return finish(pass1, qTerms, {
+      initialTop,
+      finalTop: pass1.slice(0, 6),
+      refinedTerms: [],
+    });
+  }
+  const pass2 = scoreChunks(chunks, [...qTerms, ...refinedTerms]);
+  // merge both passes, keeping each chunk's best raw score
+  const byId = new Map<number, ScoredChunk>();
+  for (const s of [...pass1, ...pass2]) {
+    const prev = byId.get(s.chunk.id);
+    if (!prev || s.raw > prev.raw) byId.set(s.chunk.id, { ...s });
+  }
+  const merged = [...byId.values()].sort((a, b) => b.raw - a.raw);
+  const finalTop = normalize(merged).slice(0, 6);
+  return finish(merged, qTerms, { initialTop, finalTop, refinedTerms });
+}
+
+// ---------- snippets & extractive answers ----------
 
 export function snippet(chunk: DocChunk, qTerms: string[]): string {
   const lower = chunk.text.toLowerCase();
@@ -215,16 +404,16 @@ export function buildRealSources(
   scene: SceneData,
 ): Source[] {
   const A = ACCENTS[rag];
-  const chunkCard = (s: ScoredChunk): Source => ({
+  const chunkCard = (s: ScoredChunk, meta?: string): Source => ({
     kind: "chunk",
     label: "chunk #" + s.chunk.id,
-    meta: "p." + s.chunk.page,
+    meta: meta ?? "p." + s.chunk.page,
     score: s.score.toFixed(2),
     scoreN: s.score,
     snippet: snippet(s.chunk, res.queryTerms),
     color: A,
   });
-  const top = res.top;
+  const top = res.finalTop;
   if (!top.length)
     return [
       {
@@ -239,10 +428,21 @@ export function buildRealSources(
       },
     ];
   if (rag === "hybrid") {
-    const cards: Source[] = top.slice(0, 2).map(chunkCard);
-    const topIds = new Set(top.map((s) => s.chunk.id));
-    scene.gActive.slice(0, 2).forEach((gi, k) => {
+    const boosted = res.boostedChunkIds ?? new Set<number>();
+    const cards: Source[] = top
+      .slice(0, 2)
+      .map((s) =>
+        chunkCard(
+          s,
+          boosted.has(s.chunk.id) ? "p." + s.chunk.page + " · graph" : undefined,
+        ),
+      );
+    (res.graphBoosted ?? []).slice(0, 2).forEach((gi, k) => {
       const n = scene.gnodes[gi];
+      if (!n) return;
+      const nBoosted = top.filter((s) =>
+        n.chunkIds?.has(s.chunk.id),
+      ).length;
       const nbrs = [...(scene.gnbr[gi] || [])]
         .slice(0, 3)
         .map((j) => scene.gnodes[j]?.label)
@@ -254,47 +454,75 @@ export function buildRealSources(
         meta: "entity",
         score: ((best?.score ?? 0.5) * 0.95).toFixed(2),
         scoreN: (best?.score ?? 0.5) * 0.95,
-        snippet: nbrs.length
-          ? "linked to " + nbrs.join(", ")
-          : "mentioned in " + (n.chunkIds?.size ?? 0) + " chunks",
+        snippet:
+          (nBoosted
+            ? `boosted ${nBoosted} chunk${nBoosted > 1 ? "s" : ""}`
+            : "matched the query") +
+          (nbrs.length ? " · linked to " + nbrs.join(", ") : ""),
         color: A,
       });
-      void topIds;
     });
     return cards;
   }
   if (rag === "agentic") {
     const cards: Source[] = [chunkCard(top[0])];
+    const refined = res.refinedTerms ?? [];
     cards.push({
       kind: "tool",
       label: "refine query",
       meta: "agent step",
-      score: "+",
-      scoreN: 0.8,
-      snippet: 're-queried "' + res.queryTerms.slice(0, 3).join(" ") + '"',
+      score: refined.length ? "+" : "·",
+      scoreN: refined.length ? 0.8 : 0.3,
+      snippet: refined.length
+        ? 'added "' + refined.join(" ") + '" and re-retrieved'
+        : "first pass sufficient — no refinement needed",
       color: A,
     });
-    if (top[1]) cards.push(chunkCard(top[1]));
+    // prefer showing a chunk the refinement surfaced (absent from pass 1)
+    const initialIds = new Set(res.initialTop.map((s) => s.chunk.id));
+    const surfaced = top.find((s) => !initialIds.has(s.chunk.id));
+    const second = surfaced ?? top[1];
+    if (second)
+      cards.push(
+        chunkCard(
+          second,
+          surfaced ? "p." + second.chunk.page + " · pass 2" : undefined,
+        ),
+      );
     return cards;
   }
   if (rag === "corrective") {
-    const rejectedRow = scene.gradeRows.find((r) => !r.pass);
     const cards: Source[] = [];
-    if (rejectedRow) {
+    (res.rejected ?? []).slice(0, 1).forEach((s) => {
       cards.push({
         kind: "reject",
-        label: "chunk #" + rejectedRow.n,
+        label: "chunk #" + s.chunk.id,
         meta: "rejected",
-        score: rejectedRow.s.toFixed(2),
-        scoreN: rejectedRow.s,
-        snippet: "graded irrelevant — re-retrieval triggered",
+        score: s.score.toFixed(2),
+        scoreN: s.score,
+        snippet: `graded ${s.score.toFixed(2)} — below threshold, re-retrieval triggered`,
         color: A,
         rejected: true,
       });
-    }
-    return cards.concat(top.slice(0, rejectedRow ? 2 : 3).map(chunkCard));
+    });
+    const replacementIds = new Set(
+      (res.replacements ?? []).map((s) => s.chunk.id),
+    );
+    cards.push(
+      ...top
+        .slice(0, cards.length ? 2 : 3)
+        .map((s) =>
+          chunkCard(
+            s,
+            replacementIds.has(s.chunk.id)
+              ? "p." + s.chunk.page + " · re-retrieved"
+              : undefined,
+          ),
+        ),
+    );
+    return cards;
   }
-  return top.slice(0, 3).map(chunkCard);
+  return top.slice(0, 3).map((s) => chunkCard(s));
 }
 
 // ---------- suggested questions for uploaded documents ----------

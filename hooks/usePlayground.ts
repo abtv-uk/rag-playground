@@ -27,7 +27,10 @@ import { PipelineRenderer } from "@/lib/renderer";
 import {
   buildRealSources,
   generateSuggestions,
-  retrieve,
+  retrieveAgentic,
+  retrieveBasic,
+  retrieveCorrective,
+  retrieveHybrid,
 } from "@/lib/retrieval";
 import { applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
 import { steps } from "@/lib/steps";
@@ -192,10 +195,21 @@ export function usePlayground() {
       let answer: string;
       let sources;
       if (doc && !doc.isSample) {
-        const res = retrieve(doc.chunks, q);
-        applyQueryToScene(renderer.view.scene, res);
+        const scene = renderer.view.scene;
+        const res =
+          rag === "hybrid"
+            ? retrieveHybrid(doc.chunks, q, {
+                nodes: scene.gnodes,
+                neighbors: scene.gnbr,
+              })
+            : rag === "corrective"
+              ? retrieveCorrective(doc.chunks, q)
+              : rag === "agentic"
+                ? retrieveAgentic(doc.chunks, q)
+                : retrieveBasic(doc.chunks, q);
+        applyQueryToScene(scene, res);
         answer = res.answer;
-        sources = buildRealSources(rag, res, renderer.view.scene);
+        sources = buildRealSources(rag, res, scene);
       } else {
         answer = ANSWERS[rag];
         sources = buildSources(rag);

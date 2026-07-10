@@ -472,6 +472,7 @@ export class PipelineRenderer {
     this.drawPanel(ctx, v, v.title, v.sub, A, lit.has("vector"));
     this.drawScatter(ctx, v, A, settle, now, {
       highlightOn: !!F.hl,
+      final: !!(F.correct || F.refine),
       active: ph === "querying" || ph === "answered",
       anim,
       src: ph === "indexing" && !reducedMotion ? idxDoc : null,
@@ -594,11 +595,20 @@ export class PipelineRenderer {
     A: string,
     settle: number,
     now: number,
-    o: { highlightOn: boolean; active: boolean; anim: boolean; src: Pt | null },
+    o: {
+      highlightOn: boolean;
+      final: boolean;
+      active: boolean;
+      anim: boolean;
+      src: Pt | null;
+    },
   ) {
     const T = this.T;
     const src = o.src || { x: p.x0 + (p.x1 - p.x0) * 0.5, y: p.y0 - 40 };
-    const rel = new Set(o.highlightOn ? this.view.scene.rel : []);
+    const scene = this.view.scene;
+    const rel = new Set(
+      o.highlightOn ? (o.final ? scene.relFinal : scene.rel) : [],
+    );
     ctx.save();
     this.rr(ctx, p.x0 + 1, p.y0 + 1, p.x1 - p.x0 - 2, p.y1 - p.y0 - 2, 13);
     ctx.clip();
@@ -826,13 +836,8 @@ export class PipelineRenderer {
     const pillBlock = stackPills ? pillH * 2 + 8 : pillH + 4;
     const top = p.y0 + (narrow ? 44 : 54);
     const bottom = p.y1 - pillBlock - 16;
-    const rows = [
-      { n: 14, pass: 1, s: 0.93 },
-      { n: 7, pass: 0, s: 0.31 },
-      { n: 22, pass: 1, s: 0.79 },
-      { n: 31, pass: 0, s: 0.28 },
-      { n: 9, pass: 1, s: 0.61 },
-    ];
+    const rows = this.view.scene.gradeRows;
+    if (!rows.length) return;
     const gap = narrow ? 6 : 10;
     let rows2 = rows;
     let rh = Math.max(16, Math.min(42, (bottom - top - (rows.length - 1) * gap) / rows.length));
@@ -849,14 +854,15 @@ export class PipelineRenderer {
     const fs = narrow ? 8.5 : 11;
     const inPad = narrow ? 7 : 12;
     rows2.forEach((r, i) => {
+      const rowShown = shown && r.graded !== false;
       const y = top + i * (rh + gap);
       ctx.save();
       this.rr(ctx, x0, y, x1 - x0, rh, narrow ? 6 : 9);
       ctx.fillStyle = T.boxFill;
       ctx.fill();
       ctx.lineWidth = 1.2;
-      if (shown && !r.pass) ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = shown ? (r.pass ? this.rgba(A, 0.5) : this.rgba(REJECT, 0.6)) : T.hair;
+      if (rowShown && !r.pass) ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = rowShown ? (r.pass ? this.rgba(A, 0.5) : this.rgba(REJECT, 0.6)) : T.hair;
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.font = "600 " + fs + 'px "JetBrains Mono",monospace';
@@ -874,11 +880,11 @@ export class PipelineRenderer {
         ctx.fillStyle = T.track;
         ctx.fill();
         this.rr(ctx, x0 + inPad, by, bw * r.s, 4, 2);
-        ctx.fillStyle = shown ? (r.pass ? A : REJECT) : T.dotDim;
+        ctx.fillStyle = rowShown ? (r.pass ? A : REJECT) : T.dotDim;
         ctx.fill();
       }
       const mk = narrow ? 3.5 : 5;
-      if (shown) {
+      if (rowShown) {
         ctx.lineWidth = 1.8;
         ctx.strokeStyle = r.pass ? A : REJECT;
         if (r.pass) {

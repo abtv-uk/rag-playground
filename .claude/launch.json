@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "rag-playground",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "/Users/aim/Documents/GitHub/design_handoff_rag_playground", "run", "dev", "--", "--port", "3100"],
+      "port": 3100
+    }
+  ]
+}

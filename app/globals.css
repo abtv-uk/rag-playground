@@ -1,0 +1,114 @@
+@import "tailwindcss";
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+body {
+  min-height: 100vh;
+  background: #0b0d11;
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+::selection {
+  background: rgba(139, 92, 246, 0.25);
+}
+
+/* Design tokens — dark theme (default) */
+.rgt {
+  --bg: #0b0d11;
+  --bar: rgba(18, 21, 27, 0.74);
+  --side: rgba(18, 21, 27, 0.58);
+  --surface: #161b22;
+  --surface2: #1d232c;
+  --ink: #e9ecf1;
+  --ink2: #b6bdc8;
+  --sub: #838c9a;
+  --sub2: #9aa3b0;
+  --faint: #626c79;
+  --hair: rgba(255, 255, 255, 0.11);
+  --hair2: rgba(255, 255, 255, 0.06);
+  --grid: rgba(255, 255, 255, 0.045);
+  --chip: rgba(255, 255, 255, 0.05);
+  --btnBg: #e9ecf1;
+  --btnTx: #0b0d11;
+}
+.rgt.light {
+  --bg: #fafbfc;
+  --bar: rgba(255, 255, 255, 0.74);
+  --side: rgba(255, 255, 255, 0.66);
+  --surface: #ffffff;
+  --surface2: #f1f3f5;
+  --ink: #11151b;
+  --ink2: #3a414b;
+  --sub: #6b7480;
+  --sub2: #8a92a0;
+  --faint: #aab0bb;
+  --hair: rgba(17, 21, 27, 0.1);
+  --hair2: rgba(17, 21, 27, 0.06);
+  --grid: rgba(17, 21, 27, 0.035);
+  --chip: rgba(17, 21, 27, 0.04);
+  --btnBg: #11151b;
+  --btnTx: #ffffff;
+}
+
+@keyframes rgblink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+}
+@keyframes rgpulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes rgshim {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 240px 0;
+  }
+}
+.rg-shim {
+  background: linear-gradient(
+    90deg,
+    var(--hair2) 0px,
+    var(--chip) 60px,
+    var(--hair2) 120px
+  );
+  background-size: 240px 100%;
+  animation: rgshim 1.2s linear infinite;
+}
+
+input::placeholder {
+  color: var(--faint);
+}
+input:focus {
+  outline: none;
+}
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rgt,
+  .rgt * {
+    animation: none !important;
+  }
+}

@@ -36,7 +36,7 @@ const SAMPLE_CHUNKS_URL =
 
 /** The bundled sample (an OpenStax open-licensed textbook) ships with
  *  precomputed chunks — loading it is a small JSON fetch instead of a
- *  multi-second client-side parse of the 200-page PDF. Regenerate the JSON
+ *  multi-second client-side parse of the 201-page PDF. Regenerate the JSON
  *  with `npm run preprocess:sample` if the PDF changes. */
 export async function loadSampleDoc(
   onProgress?: ProgressFn,

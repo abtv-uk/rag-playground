@@ -27,7 +27,7 @@ Extras worth trying:
 
 ```sh
 npm install
-npm run dev     # http://localhost:3100 (or 3000 if unconfigured)
+npm run dev     # http://localhost:3000 (pass `-- --port 3100` to match .claude/launch.json)
 ```
 
 `npm run build` produces a fully static production build (the site is deployed as a static export — see [Provenance](#provenance)).

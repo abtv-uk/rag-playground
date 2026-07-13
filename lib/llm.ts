@@ -8,7 +8,8 @@ import type { RagId } from "./types";
 
 const ENDPOINT =
   process.env.NEXT_PUBLIC_LLM_ENDPOINT || "http://localhost:8787";
-// Real gemini-3.5-flash latency observed for a several-chunk grounded prompt
+// Real latency observed for the proxy's Gemini model (see server/llm-proxy.mjs)
+// answering a several-chunk grounded prompt
 // runs 10-15s in this environment; a short timeout meant the offline
 // extractive answer almost always won the race. This only affects local-dev
 // pacing (a real visitor's fetch to localhost never connects at all), so a

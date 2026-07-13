@@ -16,6 +16,8 @@ const PDF = root + "public/sample/introduction-intellectual-property.pdf";
 const OUT = root + "public/sample/introduction-intellectual-property.chunks.json";
 
 const data = new Uint8Array(await readFile(PDF));
+// pdfjs transfers (detaches) the buffer, zeroing byteLength — capture it now
+const pdfBytes = data.byteLength;
 
 // legacy build runs in Node without a DOM or worker
 const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -38,7 +40,7 @@ for (let i = 1; i <= doc.numPages; i++) {
 const chunks = chunkPages(pages);
 const out = {
   name: "introduction-intellectual-property.pdf",
-  sizeLabel: formatSize(data.byteLength) + " · PDF · OpenStax, CC BY 4.0",
+  sizeLabel: formatSize(pdfBytes) + " · PDF · OpenStax, CC BY 4.0",
   pages: pages.length,
   chunks,
 };

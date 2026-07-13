@@ -6,9 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "dev:llm": "node --env-file=.env server/llm-proxy.mjs",
+    "preprocess:sample": "node scripts/preprocess-sample.mts"
   },
   "dependencies": {
+    "@google/genai": "^2.11.0",
     "framer-motion": "^12.19.1",
     "next": "^15.3.4",
     "pdfjs-dist": "^6.1.200",

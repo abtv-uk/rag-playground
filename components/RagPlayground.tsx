@@ -96,11 +96,7 @@ export default function RagPlayground() {
   );
 
   // --- captions ---
-  const chunkCount = state.doc
-    ? state.doc.isSample
-      ? 64
-      : state.doc.chunks.length
-    : 64;
+  const chunkCount = state.doc ? state.doc.chunks.length : 64;
   const pageCount = state.doc?.pages ?? 15;
   const captionMap: Partial<Record<typeof state.phase, string>> = {
     indexing:

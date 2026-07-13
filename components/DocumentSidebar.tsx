@@ -31,7 +31,7 @@ export default function DocumentSidebar({
   const showDocPanel = state.expanded && hasDoc;
   const doc = state.doc;
   const pages = doc?.pages ?? 15;
-  const chunkCount = doc ? (doc.isSample ? 64 : doc.chunks.length) : 64;
+  const chunkCount = doc ? doc.chunks.length : 0;
   const pageThumbs = Array.from(
     { length: Math.max(1, Math.min(pages, 8)) },
     (_, i) => String(i + 1).padStart(2, "0"),
@@ -160,7 +160,19 @@ export default function DocumentSidebar({
                     wordBreak: "break-all",
                   }}
                 >
-                  {doc?.name ?? ""}
+                  {doc?.sourceUrl ? (
+                    <a
+                      href={doc.sourceUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="open the original PDF"
+                      style={{ color: "var(--ink)", textDecoration: "underline" }}
+                    >
+                      {doc.name}
+                    </a>
+                  ) : (
+                    (doc?.name ?? "")
+                  )}
                 </div>
                 <div style={{ fontFamily: MONO, fontSize: 10, color: "var(--sub2)", marginTop: 5 }}>
                   {doc?.sizeLabel ?? ""}

@@ -4,25 +4,24 @@
 // answered. Mirrors state into the canvas renderer's mutable view so the rAF
 // loop reads fresh values without re-rendering React each frame.
 //
-// Documents: the bundled sample keeps the scripted demo (canned answers,
-// sources and scene); uploaded files / scraped URLs get real chunking,
-// lexical retrieval and extractive answers.
+// All documents run the real pipeline (chunking, per-mode retrieval,
+// extractive or LLM-backed answers). The bundled sample is an OpenStax
+// textbook whose chunks ship precomputed, so loading it skips the PDF parse.
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import {
-  ANSWERS,
   INDEX_MS,
   STEP_MS,
   STREAM_WORD_MS,
   SUGGESTIONS,
-  buildSources,
 } from "@/lib/constants";
 import {
-  SAMPLE_DOC,
   fetchUrl,
+  loadSampleDoc,
   parseFile,
   type LoadedDoc,
 } from "@/lib/document";
+import { generateLlmAnswer } from "@/lib/llm";
 import { PipelineRenderer } from "@/lib/renderer";
 import {
   buildRealSources,
@@ -49,6 +48,7 @@ const INITIAL: PlaygroundState = {
   idxStage: 0,
   doc: null,
   loading: false,
+  loadingMsg: "",
   loadError: "",
   suggestions: SUGGESTIONS,
 };
@@ -78,6 +78,7 @@ export function usePlayground() {
   const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const lastQueryRef = useRef("");
   const loadSeqRef = useRef(0);
+  const querySeqRef = useRef(0);
 
   const set = useCallback(
     (patch: Partial<PlaygroundState>) => {
@@ -135,12 +136,13 @@ export function usePlayground() {
 
   const adoptDoc = useCallback(
     (doc: LoadedDoc) => {
-      renderer.view.scene = doc.isSample ? sampleScene() : buildScene(doc);
+      renderer.view.scene = buildScene(doc);
       renderer.resetGraphInteraction();
-      const generated = doc.isSample ? [] : generateSuggestions(doc.chunks);
+      const generated = generateSuggestions(doc.chunks);
       set({
         doc,
         loading: false,
+        loadingMsg: "",
         loadError: "",
         suggestions: generated.length ? generated : SUGGESTIONS,
       });
@@ -150,17 +152,20 @@ export function usePlayground() {
   );
 
   const loadAsync = useCallback(
-    (job: Promise<LoadedDoc>) => {
+    (makeJob: (onProgress: (m: string) => void) => Promise<LoadedDoc>) => {
       const seq = ++loadSeqRef.current;
-      set({ loading: true, loadError: "" });
-      job.then(
+      set({ loading: true, loadingMsg: "reading document…", loadError: "" });
+      const onProgress = (m: string) => {
+        if (seq === loadSeqRef.current) set({ loadingMsg: m });
+      };
+      makeJob(onProgress).then(
         (doc) => {
           if (seq === loadSeqRef.current) adoptDoc(doc);
         },
         (err: unknown) => {
           if (seq !== loadSeqRef.current) return;
           const msg = err instanceof Error ? err.message : String(err);
-          set({ loading: false, loadError: msg });
+          set({ loading: false, loadingMsg: "", loadError: msg });
         },
       );
     },
@@ -186,34 +191,37 @@ export function usePlayground() {
   const runQuery = useCallback(
     (q: string) => {
       clearTimers();
+      const seq = ++querySeqRef.current;
       lastQueryRef.current = q;
       const { rag, doc } = stateRef.current;
       const qsteps = steps(rag);
       renderer.view.querySteps = qsteps;
       renderer.view.queryStart = performance.now();
 
-      let answer: string;
-      let sources;
-      if (doc && !doc.isSample) {
-        const scene = renderer.view.scene;
-        const res =
-          rag === "hybrid"
-            ? retrieveHybrid(doc.chunks, q, {
-                nodes: scene.gnodes,
-                neighbors: scene.gnbr,
-              })
-            : rag === "corrective"
-              ? retrieveCorrective(doc.chunks, q)
-              : rag === "agentic"
-                ? retrieveAgentic(doc.chunks, q)
-                : retrieveBasic(doc.chunks, q);
-        applyQueryToScene(scene, res);
-        answer = res.answer;
-        sources = buildRealSources(rag, res, scene);
-      } else {
-        answer = ANSWERS[rag];
-        sources = buildSources(rag);
-      }
+      if (!doc) return;
+      const scene = renderer.view.scene;
+      const res =
+        rag === "hybrid"
+          ? retrieveHybrid(doc.chunks, q, {
+              nodes: scene.gnodes,
+              neighbors: scene.gnbr,
+            })
+          : rag === "corrective"
+            ? retrieveCorrective(doc.chunks, q)
+            : rag === "agentic"
+              ? retrieveAgentic(doc.chunks, q)
+              : retrieveBasic(doc.chunks, q);
+      applyQueryToScene(scene, res);
+      const sources = buildRealSources(rag, res, scene);
+      // extractive answer resolves synchronously and is always the fallback;
+      // the real-LLM proxy (local dev only — see server/llm-proxy.mjs) races
+      // against it in the background and wins if it responds in time.
+      const extractive = res.answer;
+      const answerPromise = generateLlmAnswer(
+        rag,
+        q,
+        res.finalTop.map((s) => s.chunk),
+      ).then((llm) => llm ?? extractive);
 
       set({
         query: q,
@@ -227,19 +235,24 @@ export function usePlayground() {
       after(STEP_MS * (streamIdx - 0.4), () =>
         set({ sources, sourcesVisible: true }),
       );
-      after(STEP_MS * streamIdx, () => streamAnswer(answer));
+      after(STEP_MS * streamIdx, () => {
+        answerPromise.then((text) => {
+          if (seq === querySeqRef.current) streamAnswer(text);
+        });
+      });
     },
     [after, clearTimers, renderer, set, streamAnswer],
   );
 
   const actions: PlaygroundActions = {
-    loadSample: () => adoptDoc(SAMPLE_DOC),
-    loadFile: (file) => loadAsync(parseFile(file)),
-    loadUrl: (url) => loadAsync(fetchUrl(url)),
+    loadSample: () => loadAsync((p) => loadSampleDoc(p)),
+    loadFile: (file) => loadAsync((p) => parseFile(file, p)),
+    loadUrl: (url) => loadAsync((p) => fetchUrl(url, p)),
     reindex: runIndex,
     clear: () => {
       clearTimers();
       loadSeqRef.current++;
+      querySeqRef.current++;
       lastQueryRef.current = "";
       renderer.view.scene = sampleScene();
       renderer.resetGraphInteraction();
@@ -251,6 +264,7 @@ export function usePlayground() {
         streaming: false,
         doc: null,
         loading: false,
+        loadingMsg: "",
         loadError: "",
         suggestions: SUGGESTIONS,
         phase: "empty",

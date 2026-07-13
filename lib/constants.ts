@@ -38,21 +38,11 @@ export const BLURBS: Record<RagId, string> = {
     "Retrieves, grades each chunk for relevance, then re-retrieves or corrects before the answer is generated.",
 };
 
-export const ANSWERS: Record<RagId, string> = {
-  naive:
-    "Multi-head attention runs several attention functions in parallel. Each head projects the queries, keys and values into a different learned subspace, the outputs are concatenated and projected once more — letting the model attend to information from several representation subspaces at once.",
-  hybrid:
-    "Multi-head attention attends in parallel across several projected subspaces. The knowledge graph confirms it sits inside both the Encoder and Decoder stacks and feeds the position-wise Feed-Forward layer, so this answer is grounded in both the passage text and the linked Transformer components.",
-  agentic:
-    'The agent first retrieved the definition, noticed it referenced "heads" without a count, then re-queried for specifics. The paper uses 8 parallel attention heads, each of dimension 64, concatenated back to the model dimension of 512 before a final linear projection.',
-  corrective:
-    "Initial retrieval surfaced two weakly-relevant chunks which the grader rejected. After re-retrieval the answer was generated only from high-scoring passages: multi-head attention performs 8 parallel attention functions and concatenates them, attending to different subspaces simultaneously.",
-};
-
+// generic fallback — real suggestions are generated from the loaded document
 export const SUGGESTIONS = [
-  "What is multi-head attention?",
-  "How does positional encoding work?",
-  "Why drop recurrence?",
+  "What is this document about?",
+  "What are the key terms defined here?",
+  "Summarize the main argument.",
 ];
 
 export const QUERY_CAPTIONS: Record<RagId, string> = {
@@ -77,65 +67,3 @@ export function indexCaptions(
   ];
 }
 
-export function buildSources(rag: RagId): Source[] {
-  const A = ACCENTS[rag];
-  const chunk = (id: number, p: number, score: number, snip: string): Source => ({
-    kind: "chunk",
-    label: "chunk #" + id,
-    meta: "p." + p,
-    score: score.toFixed(2),
-    scoreN: score,
-    snippet: snip,
-    color: A,
-  });
-  const node = (l: string, score: number, snip: string): Source => ({
-    kind: "node",
-    label: l,
-    meta: "entity",
-    score: score.toFixed(2),
-    scoreN: score,
-    snippet: snip,
-    color: A,
-  });
-  if (rag === "hybrid")
-    return [
-      chunk(14, 3, 0.91, "…employ h = 8 parallel attention layers, or heads…"),
-      node("Multi-Head", 0.88, "linked to Self-Attention, Encoder, Decoder"),
-      node("Feed-Forward", 0.74, "position-wise, applied after attention"),
-      chunk(22, 4, 0.69, "…each head outputs are concatenated and projected…"),
-    ];
-  if (rag === "agentic")
-    return [
-      chunk(14, 3, 0.92, "…employ h = 8 parallel attention layers, or heads…"),
-      {
-        kind: "tool",
-        label: "refine query",
-        meta: "agent step",
-        score: "+",
-        scoreN: 0.8,
-        snippet: 're-queried "number of attention heads"',
-        color: A,
-      },
-      chunk(31, 6, 0.83, "…d_model / h = 64 dimensions per head…"),
-    ];
-  if (rag === "corrective")
-    return [
-      {
-        kind: "reject",
-        label: "chunk #07",
-        meta: "rejected",
-        score: "0.31",
-        scoreN: 0.31,
-        snippet: "graded irrelevant — re-retrieval triggered",
-        color: A,
-        rejected: true,
-      },
-      chunk(14, 3, 0.93, "…employ h = 8 parallel attention layers, or heads…"),
-      chunk(22, 4, 0.79, "…outputs are concatenated and once again projected…"),
-    ];
-  return [
-    chunk(14, 3, 0.89, "…employ h = 8 parallel attention layers, or heads…"),
-    chunk(22, 4, 0.72, "…the outputs are concatenated and projected…"),
-    chunk(9, 2, 0.58, "…attention allows modeling of dependencies…"),
-  ];
-}

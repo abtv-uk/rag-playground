@@ -272,7 +272,26 @@ export function snippet(chunk: DocChunk, qTerms: string[]): string {
 function sentences(text: string): string[] {
   return (text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [])
     .map((s) => s.trim())
-    .filter((s) => s.split(/\s+/).length >= 5);
+    .filter((s) => s.split(/\s+/).length >= 6);
+}
+
+// Textbook scaffolding that is term-dense but not explanatory: section
+// headings, multiple-choice options, learning objectives, figure captions.
+// Penalized (not excluded) so it only surfaces when nothing better matches.
+function looksStructural(s: string): boolean {
+  if (/^\s*\d/.test(s)) return true; // "1 Trade Secret Protection"
+  if (/^\s*[a-eA-E][.)]\s/.test(s)) return true; // "b. …" quiz option
+  if (/^\s*[•·▪◦-]\s/.test(s)) return true; // bullet
+  if (
+    /will be able to|learning objective|assessment question|\(credit:|figure\s*\d|table\s*\d|chapter\s*(summary|outline)|key terms/i.test(
+      s,
+    )
+  )
+    return true;
+  // heading soup: mostly Capitalized words, few lowercase function words
+  const words = s.split(/\s+/).filter(Boolean);
+  const lower = words.filter((w) => /^[a-z]/.test(w)).length;
+  return lower / (words.length || 1) < 0.35;
 }
 
 function extractAnswer(top: ScoredChunk[], qTerms: string[]): string {
@@ -281,9 +300,11 @@ function extractAnswer(top: ScoredChunk[], qTerms: string[]): string {
   for (const sc of top) {
     for (const s of sentences(sc.chunk.text)) {
       const t = tokenize(s);
-      let score = 0;
-      for (const q of qTerms) if (t.some((w) => w === q || w.startsWith(q))) score++;
-      score = score / Math.sqrt(t.length || 1) + sc.score * 0.1;
+      let hits = 0;
+      for (const q of qTerms) if (t.some((w) => w === q || w.startsWith(q))) hits++;
+      if (!hits) continue; // only sentences that actually mention the query
+      let score = hits / Math.sqrt(t.length || 1) + sc.score * 0.1;
+      if (looksStructural(s)) score *= 0.15;
       cands.push({ s, score, order: order++ });
     }
   }
@@ -323,10 +344,24 @@ export interface EntityGraph {
 }
 
 const ENTITY_STOP = new Set(
-  "The This That These Those There Here What When Where Which While With Without From Into After Before Because However Although Chapter Section Figure Table Page Note Also And But For Not You Your Our They Their".split(
-    " ",
-  ),
+  ("The This That These Those There Here What When Where Which While With Without " +
+    "From Into After Before Because However Although Chapter Section Figure Table " +
+    "Page Note Also And But For Not You Your Our They Their " +
+    // citation / reference artifacts (legal & academic texts)
+    "See Rule Fed Ibid Cir Supp Vol Pub Sec Art Reporter Nutshell Eds Trans Rev " +
+    "Stat Reg Ann App Ch Pt Ed Cf Id No Press University Journal Review Rev'd " +
+    "Appendix Index Contents").split(/\s+/),
 );
+
+/** An entity must be a real name, not a citation abbreviation. Short single
+ *  tokens ("Fed", "Ct", "Id") are citation noise; multi-word names and longer
+ *  acronyms ("DMCA", "USPTO") are kept. */
+function isCitationArtifact(term: string): boolean {
+  const single = !term.includes(" ");
+  if (single && term.length < 4) return true;
+  if (/^\d/.test(term)) return true;
+  return false;
+}
 
 export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
   const counts = new Map<string, { count: number; chunkIds: Set<number> }>();
@@ -338,7 +373,9 @@ export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
     let m: RegExpExecArray | null;
     while ((m = re.exec(c.text))) {
       const term = m[1];
-      if (ENTITY_STOP.has(term.split(" ")[0])) continue;
+      const wordsInTerm = term.split(" ");
+      if (wordsInTerm.some((w) => ENTITY_STOP.has(w))) continue;
+      if (isCitationArtifact(term)) continue;
       found.add(term);
       const e = counts.get(term) || { count: 0, chunkIds: new Set<number>() };
       e.count++;

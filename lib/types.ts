@@ -34,7 +34,7 @@ export interface LoadedDocInfo {
   sizeLabel: string;
   pages: number;
   chunks: { id: number; page: number; text: string }[];
-  isSample: boolean;
+  sourceUrl?: string;
 }
 
 export interface PlaygroundState {
@@ -50,6 +50,7 @@ export interface PlaygroundState {
   idxStage: number;
   doc: LoadedDocInfo | null;
   loading: boolean;
+  loadingMsg: string;
   loadError: string;
   suggestions: string[];
 }

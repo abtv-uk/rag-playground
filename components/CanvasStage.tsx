@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ACCENTS, REJECT } from "@/lib/constants";
+import { SAMPLE_PDF_URL } from "@/lib/document";
 import type { PlaygroundActions } from "@/hooks/usePlayground";
 import type { PipelineRenderer } from "@/lib/renderer";
 import type { PlaygroundState } from "@/lib/types";
@@ -171,7 +172,7 @@ export default function CanvasStage({
                         color: "var(--ink)",
                       }}
                     >
-                      reading document…
+                      {state.loadingMsg || "reading document…"}
                     </div>
                   </>
                 ) : (
@@ -359,7 +360,16 @@ export default function CanvasStage({
                   marginTop: 10,
                 }}
               >
-                attention-is-all-you-need.pdf · 15 pp
+                Introduction to Intellectual Property · OpenStax · CC BY 4.0
+                {" · "}
+                <a
+                  href={SAMPLE_PDF_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: "var(--sub)", textDecoration: "underline" }}
+                >
+                  preview PDF ↗
+                </a>
               </div>
             </div>
           </motion.div>

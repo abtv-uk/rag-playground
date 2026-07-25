@@ -3,9 +3,18 @@
 import type { CSSProperties } from "react";
 import { ACCENTS, TABS } from "@/lib/constants";
 import { rgba } from "@/lib/color";
-import type { PlaygroundState, RagId } from "@/lib/types";
+import type { GenPhase, PlaygroundState, RagId } from "@/lib/types";
 
 const MONO = "'JetBrains Mono',monospace";
+
+const GEN_STATUS: Record<GenPhase, string> = {
+  idle: "retrieving…",
+  embedding: "embedding…",
+  planning: "planning…",
+  grading: "grading…",
+  waiting: "thinking…",
+  generating: "generating…",
+};
 
 export default function TopNav({
   state,
@@ -30,6 +39,12 @@ export default function TopNav({
     answered: [ACCENTS.corrective, "answered"],
   };
   const [stColor, stLabel] = statusMap[state.phase];
+  // during a query the phase alone can't tell retrieval from generation —
+  // genPhase can, so a long generate doesn't keep claiming "retrieving"
+  const label =
+    state.phase === "querying" && state.genPhase !== "idle"
+      ? GEN_STATUS[state.genPhase]
+      : stLabel;
 
   return (
     <div
@@ -167,7 +182,7 @@ export default function TopNav({
               flex: "none",
             }}
           />
-          {stLabel}
+          {label}
         </div>
       </div>
     </div>

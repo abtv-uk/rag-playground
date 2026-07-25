@@ -51,7 +51,15 @@ const INITIAL: PlaygroundState = {
   loadingMsg: "",
   loadError: "",
   suggestions: SUGGESTIONS,
+  degraded: false,
+  genPhase: "idle",
 };
+
+// How long to wait for generated prose before giving up and showing the
+// offline extractive answer instead. Bounds the pathological case (hung or
+// very slow backend) to something a user will sit through; a healthy
+// generator streams its first token well inside this.
+const GEN_DEADLINE_MS = 6000;
 
 export interface PlaygroundActions {
   loadSample: () => void;
@@ -79,6 +87,7 @@ export function usePlayground() {
   const lastQueryRef = useRef("");
   const loadSeqRef = useRef(0);
   const querySeqRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   const set = useCallback(
     (patch: Partial<PlaygroundState>) => {
@@ -89,15 +98,22 @@ export function usePlayground() {
       view.phase = next.phase;
       view.dark = next.dark;
       view.streaming = next.streaming;
+      view.genPhase = next.genPhase;
       force();
     },
     [renderer],
   );
 
+  // Aborting here (rather than only on the llm.ts timeout) is what stops a
+  // superseded query — tab switch, new question, clear, unmount — from
+  // leaving an orphan request in flight.
   const clearTimers = useCallback(() => {
     timersRef.current.forEach(clearTimeout);
     timersRef.current = [];
-  }, []);
+    abortRef.current?.abort();
+    abortRef.current = null;
+    renderer.view.holdStep = null;
+  }, [renderer]);
 
   const after = useCallback((ms: number, fn: () => void) => {
     timersRef.current.push(setTimeout(fn, ms));
@@ -172,16 +188,20 @@ export function usePlayground() {
     [adoptDoc, set],
   );
 
-  const streamAnswer = useCallback(
+  /** Synthetic word-by-word pacer, used only for the offline extractive
+   *  fallback so the degraded path still looks alive. Real generated text
+   *  arrives as deltas and is appended verbatim — pacing it here would
+   *  collapse the newlines a model actually emits. */
+  const streamExtractive = useCallback(
     (text: string) => {
       const words = text.split(" ");
-      set({ answer: "", streaming: true });
+      set({ answer: "", streaming: true, genPhase: "generating" });
       let i = 0;
       const tick = () => {
         i++;
         set({ answer: words.slice(0, i).join(" ") });
         if (i < words.length) after(STREAM_WORD_MS, tick);
-        else set({ streaming: false, phase: "answered" });
+        else set({ streaming: false, phase: "answered", genPhase: "idle" });
       };
       after(40, tick);
     },
@@ -213,15 +233,11 @@ export function usePlayground() {
               : retrieveBasic(doc.chunks, q);
       applyQueryToScene(scene, res);
       const sources = buildRealSources(rag, res, scene);
-      // extractive answer resolves synchronously and is always the fallback;
-      // the real-LLM proxy (local dev only — see server/llm-proxy.mjs) races
-      // against it in the background and wins if it responds in time.
+      // The extractive answer resolves synchronously and is the fallback of
+      // last resort. Real generation runs against it with a deadline: first
+      // token wins, and if nothing arrives in time we show the extractive
+      // answer and say so, rather than shimmering indefinitely.
       const extractive = res.answer;
-      const answerPromise = generateLlmAnswer(
-        rag,
-        q,
-        res.finalTop.map((s) => s.chunk),
-      ).then((llm) => llm ?? extractive);
 
       set({
         query: q,
@@ -229,19 +245,68 @@ export function usePlayground() {
         sources: [],
         sourcesVisible: false,
         streaming: false,
+        degraded: false,
+        genPhase: "waiting",
         phase: "querying",
       });
+
       const streamIdx = qsteps.findIndex((s) => s.stream);
       after(STEP_MS * (streamIdx - 0.4), () =>
         set({ sources, sourcesVisible: true }),
       );
-      after(STEP_MS * streamIdx, () => {
-        answerPromise.then((text) => {
-          if (seq === querySeqRef.current) streamAnswer(text);
-        });
-      });
+      // hold the pipeline on the generate step until something arrives
+      renderer.view.holdStep = streamIdx;
+
+      const ac = new AbortController();
+      abortRef.current = ac;
+
+      let released = false;
+      const release = (fallback: string | null) => {
+        if (released || seq !== querySeqRef.current) return;
+        released = true;
+        renderer.view.holdStep = null;
+        if (fallback != null) {
+          set({ degraded: true });
+          streamExtractive(fallback);
+        } else {
+          set({ answer: "", streaming: true, genPhase: "generating" });
+        }
+      };
+
+      const deadline = setTimeout(() => release(extractive), GEN_DEADLINE_MS);
+      timersRef.current.push(deadline);
+
+      generateLlmAnswer(
+        {
+          rag,
+          query: q,
+          chunks: res.finalTop.map((s) => s.chunk),
+        },
+        (delta) => {
+          if (seq !== querySeqRef.current) return;
+          release(null); // first token releases the hold
+          clearTimeout(deadline);
+          set({ answer: stateRef.current.answer + delta });
+        },
+        (phase) => {
+          if (seq === querySeqRef.current) set({ genPhase: phase });
+        },
+        ac.signal,
+      ).then(
+        (ok) => {
+          clearTimeout(deadline);
+          if (seq !== querySeqRef.current) return;
+          if (!ok) release(extractive);
+          else if (released)
+            set({ streaming: false, phase: "answered", genPhase: "idle" });
+        },
+        () => {
+          clearTimeout(deadline);
+          release(extractive);
+        },
+      );
     },
-    [after, clearTimers, renderer, set, streamAnswer],
+    [after, clearTimers, renderer, set, streamExtractive],
   );
 
   const actions: PlaygroundActions = {
@@ -267,6 +332,8 @@ export function usePlayground() {
         loadingMsg: "",
         loadError: "",
         suggestions: SUGGESTIONS,
+        degraded: false,
+        genPhase: "idle",
         phase: "empty",
       });
     },

@@ -1,11 +1,25 @@
 "use client";
 
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import AnswerBody from "./AnswerBody";
 import { NAMES, REJECT } from "@/lib/constants";
 import { rgba } from "@/lib/color";
-import type { PlaygroundState } from "@/lib/types";
+import type { GenPhase, PlaygroundState } from "@/lib/types";
 
 const MONO = "'JetBrains Mono',monospace";
+
+// What the chip says while a query is in flight. Previously this was a
+// binary streaming/retrieving guess, which claimed "retrieving" for the
+// entire generation wait.
+const CHIP_LABEL: Record<GenPhase, string> = {
+  idle: "retrieving",
+  embedding: "embedding",
+  planning: "planning",
+  grading: "grading",
+  waiting: "thinking",
+  generating: "generating",
+};
 
 export default function OutputPanel({
   state,
@@ -27,6 +41,27 @@ export default function OutputPanel({
   const isReady = state.phase === "ready";
   const isQuerying = state.phase === "querying";
   const isAnswered = state.phase === "answered";
+
+  // clicking an inline [n] citation scrolls its trace card into view and
+  // flashes it, so the answer text and the retrieval trace stay connected
+  const cardRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const [flashed, setFlashed] = useState<number | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+    },
+    [],
+  );
+  const onCite = useCallback((chunkId: number) => {
+    cardRefs.current[chunkId]?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+    setFlashed(chunkId);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashed(null), 1200);
+  }, []);
 
   const showGenChip = isQuerying || (isAnswered && state.streaming);
   const outIdle =
@@ -100,7 +135,7 @@ export default function OutputPanel({
                 animation: "rgblink 1s ease-in-out infinite",
               }}
             />
-            {state.streaming ? "generating" : "retrieving"}
+            {CHIP_LABEL[state.genPhase]}
           </span>
         )}
       </div>
@@ -169,23 +204,28 @@ export default function OutputPanel({
               }}
             >
               ANSWER
-            </div>
-            <div style={{ fontSize: 14, lineHeight: 1.62, color: "var(--ink2)" }}>
-              {state.answer}
-              {state.streaming && (
+              {state.degraded && (
                 <span
                   style={{
-                    display: "inline-block",
-                    width: 7,
-                    height: 15,
-                    background: accent,
-                    marginLeft: 2,
-                    transform: "translateY(2px)",
-                    animation: "rgblink .8s step-end infinite",
+                    marginLeft: 8,
+                    padding: "1.5px 5px",
+                    borderRadius: 3,
+                    border: "1px solid var(--hair)",
+                    color: "var(--sub2)",
+                    letterSpacing: "0.08em",
                   }}
-                />
+                >
+                  EXTRACTIVE FALLBACK
+                </span>
               )}
             </div>
+            <AnswerBody
+              text={state.answer}
+              sources={state.sources}
+              accent={accent}
+              streaming={state.streaming}
+              onCite={onCite}
+            />
           </div>
         )}
 
@@ -219,15 +259,24 @@ export default function OutputPanel({
                 return (
                   <motion.div
                     key={src.label + i}
+                    ref={(el) => {
+                      if (src.chunkId != null) cardRefs.current[src.chunkId] = el;
+                    }}
                     initial={{ opacity: 0, x: 14 }}
                     animate={{ opacity: src.rejected ? 0.62 : 1, x: 0 }}
                     transition={{ duration: 0.25, delay: i * 0.06 }}
                     style={{
-                      border: "1px solid var(--hair)",
+                      border: `1px ${src.rejected ? "dashed" : "solid"} ${
+                        flashed === src.chunkId ? col : "var(--hair)"
+                      }`,
+                      boxShadow:
+                        flashed === src.chunkId
+                          ? `0 0 0 3px ${rgba(col, 0.16)}`
+                          : "none",
+                      transition: "border-color .3s, box-shadow .3s",
                       borderRadius: 9,
                       background: "var(--surface)",
                       padding: "9px 11px",
-                      borderStyle: src.rejected ? "dashed" : "solid",
                     }}
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>

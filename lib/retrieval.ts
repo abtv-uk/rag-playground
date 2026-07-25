@@ -441,6 +441,11 @@ export function buildRealSources(
   scene: SceneData,
 ): Source[] {
   const A = ACCENTS[rag];
+  const top = res.finalTop;
+  // The generator is handed `finalTop` in order and cites passages by their
+  // 1-based position, so that position is the citation number a card must
+  // claim for an inline [n] to resolve to it.
+  const citationOf = new Map(top.map((s, i) => [s.chunk.id, i + 1]));
   const chunkCard = (s: ScoredChunk, meta?: string): Source => ({
     kind: "chunk",
     label: "chunk #" + s.chunk.id,
@@ -449,8 +454,9 @@ export function buildRealSources(
     scoreN: s.score,
     snippet: snippet(s.chunk, res.queryTerms),
     color: A,
+    chunkId: s.chunk.id,
+    citation: citationOf.get(s.chunk.id),
   });
-  const top = res.finalTop;
   if (!top.length)
     return [
       {
@@ -540,6 +546,7 @@ export function buildRealSources(
         snippet: `graded ${s.score.toFixed(2)} — below threshold, re-retrieval triggered`,
         color: A,
         rejected: true,
+        chunkId: s.chunk.id,
       });
     });
     const replacementIds = new Set(

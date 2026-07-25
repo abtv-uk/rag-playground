@@ -1,19 +1,19 @@
-// Client for the local-only LLM proxy (server/llm-proxy.mjs). Never throws —
-// returns null on any failure (proxy not running, timeout, error response) so
-// callers can fall back to the offline extractive answer. The proxy only
-// ever listens on localhost, so this resolves to nothing for real visitors
-// of the deployed static site — it's a local-dev enhancement only.
+// Client for the generation backend. Never throws — resolves `false` on any
+// failure (endpoint down, timeout, error response, abort) so callers can
+// fall back to the offline extractive answer.
+//
+// Transport is currently a single JSON response, surfaced through the same
+// delta callback that token streaming will use, so swapping in SSE is a
+// change to this file only.
 
-import type { RagId } from "./types";
+import type { GenPhase, RagId } from "./types";
 
 const ENDPOINT =
   process.env.NEXT_PUBLIC_LLM_ENDPOINT || "http://localhost:8787";
-// Real latency observed for the proxy's Gemini model (see server/llm-proxy.mjs)
-// answering a several-chunk grounded prompt
-// runs 10-15s in this environment; a short timeout meant the offline
-// extractive answer almost always won the race. This only affects local-dev
-// pacing (a real visitor's fetch to localhost never connects at all), so a
-// generous budget is fine.
+
+// Ceiling on a single request. The caller applies its own, much shorter
+// deadline before falling back to the extractive answer; this only bounds
+// how long the request itself may stay open.
 const TIMEOUT_MS = 20000;
 
 export interface LlmChunk {
@@ -22,28 +22,46 @@ export interface LlmChunk {
   text: string;
 }
 
+export interface GenerateRequest {
+  rag: RagId;
+  query: string;
+  chunks: LlmChunk[];
+}
+
 export async function generateLlmAnswer(
-  rag: RagId,
-  query: string,
-  chunks: LlmChunk[],
-): Promise<string | null> {
-  if (!chunks.length) return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  req: GenerateRequest,
+  onDelta: (delta: string) => void,
+  onPhase: (phase: GenPhase) => void,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (!req.chunks.length) return false;
+
+  // combine the caller's abort with our own timeout
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+
   try {
+    onPhase("waiting");
     const res = await fetch(ENDPOINT + "/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rag, query, chunks }),
-      signal: controller.signal,
+      body: JSON.stringify(req),
+      signal: ac.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return false;
     const data = await res.json();
     const answer = typeof data.answer === "string" ? data.answer.trim() : "";
-    return answer || null;
+    if (!answer) return false;
+    if (signal.aborted) return false;
+    onPhase("generating");
+    onDelta(answer);
+    return true;
   } catch {
-    return null; // proxy not running, network error, or timeout — fall back silently
+    return false; // endpoint down, network error, timeout, or abort
   } finally {
     clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
   }
 }

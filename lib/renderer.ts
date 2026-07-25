@@ -5,7 +5,16 @@
 import { ACCENTS, INDEX_MS, REJECT, STEP_MS } from "./constants";
 import { sampleScene, type SceneData } from "./scene";
 import { steps } from "./steps";
-import type { Phase, QueryStep, RagId } from "./types";
+import type { GenPhase, Phase, QueryStep, RagId } from "./types";
+
+const GEN_PHASE_SUB: Record<GenPhase, string> = {
+  idle: "generate",
+  embedding: "embedding query…",
+  planning: "planning…",
+  grading: "grading chunks…",
+  waiting: "thinking…",
+  generating: "generating…",
+};
 
 export interface RendererView {
   rag: RagId;
@@ -17,6 +26,12 @@ export interface RendererView {
   querySteps: QueryStep[] | null;
   reducedMotion: boolean;
   scene: SceneData;
+  /** Step index the query animation may not advance past, or null to run
+   *  free. Set while waiting on the generator so the pipeline parks on the
+   *  generate step instead of racing ahead and freezing on the last one.
+   *  Clearing it lets the normal wall-clock step catch up immediately. */
+  holdStep: number | null;
+  genPhase: GenPhase;
 }
 
 interface Pt {
@@ -122,6 +137,8 @@ export class PipelineRenderer {
     querySteps: null,
     reducedMotion: false,
     scene: sampleScene(),
+    holdStep: null,
+    genPhase: "idle",
   };
 
   private cv: HTMLCanvasElement | null = null;
@@ -442,6 +459,9 @@ export class PipelineRenderer {
       const el = performance.now() - this.view.queryStart;
       step = Math.min(qsteps.length - 1, Math.floor(el / STEP_MS));
       if (ph === "answered" || reducedMotion) step = qsteps.length - 1;
+      // park on the generate step while the backend is still working
+      if (this.view.holdStep != null)
+        step = Math.min(step, this.view.holdStep);
       if (ph === "querying" && qsteps[step])
         (qsteps[step].e || []).forEach((x) => curE.add(x));
     }
@@ -507,8 +527,12 @@ export class PipelineRenderer {
     Object.keys(L.nodes).forEach((id) => {
       const n = L.nodes[id];
       if (n.kind === "agent") return;
-      if (id === "llm") n.sub = this.view.streaming ? "generating…" : "generate";
+      if (id === "llm") n.sub = GEN_PHASE_SUB[this.view.genPhase];
       this.drawNode(ctx, n, A, { lit: lit.has(id) });
+      // ring only once the animation has actually caught up to the hold —
+      // before that the pipeline is still legitimately retrieving
+      if (id === "llm" && this.view.holdStep != null && step >= this.view.holdStep)
+        this.drawWaitRing(ctx, n, A, now, reducedMotion);
     });
     if (rag === "agentic") this.drawAgentScene(ctx, L, A, now, { lit, anim, F });
     this.drawOutputTag(ctx, L, A, lit.has("output"));
@@ -1168,6 +1192,35 @@ export class PipelineRenderer {
       ctx.lineWidth = 1.4;
       ctx.stroke();
     }
+  }
+
+  /** Rotating arc around a node while the pipeline is held waiting on the
+   *  generator. A held pipeline must look held, not frozen. */
+  private drawWaitRing(
+    ctx: CanvasRenderingContext2D,
+    n: DiagramNode,
+    A: string,
+    now: number,
+    reducedMotion: boolean,
+  ) {
+    const r = Math.max(n.w || 46, n.h || 46) / 2 + 9;
+    ctx.save();
+    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = this.rgba(A, 0.3);
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    if (!reducedMotion) {
+      const t = ((now % 2400) / 2400) * Math.PI * 2;
+      ctx.setLineDash([]);
+      ctx.strokeStyle = A;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r, t, t + Math.PI * 0.5);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   private drawNode(

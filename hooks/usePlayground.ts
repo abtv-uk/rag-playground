@@ -138,7 +138,7 @@ export function usePlayground() {
     (doc: LoadedDoc) => {
       renderer.view.scene = buildScene(doc);
       renderer.resetGraphInteraction();
-      const generated = generateSuggestions(doc.chunks);
+      const generated = generateSuggestions(doc.chunks, doc.name);
       set({
         doc,
         loading: false,

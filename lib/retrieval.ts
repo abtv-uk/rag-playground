@@ -563,38 +563,160 @@ export function buildRealSources(
 }
 
 // ---------- suggested questions for uploaded documents ----------
+//
+// Three questions that tour the document: its overall topic, a theme from
+// the middle chapters, and what the final section covers. Retrieval is
+// lexical, so every question must carry terms that actually occur in the
+// region it points at — "What does Chapter 3 discuss?" is unanswerable if
+// no chunk says "Chapter 3", but "patent cases" or "trade secrets" is.
 
-export function generateSuggestions(chunks: DocChunk[]): string[] {
-  const graph = extractEntityGraph(chunks);
-  const full = (i: number) => graph.nodes[i]?.full;
+// tokens that make a phrase useless as a question subject: site chrome,
+// citation abbreviations, textbook scaffolding
+const PHRASE_NOISE =
+  /\b(www|org|com|edu|net|http|https|html|pdf|isbn|openstax|access|free|page|pages|figure|table|chapter|section|appendix|index|contents|answer|key|credit|rule|rules|fed|civ|supp|cir|inc|llc|ibid|seq|stat|reg|vol|pub|press|review|journal|university|learning|objectives?|completing|question|questions|assessment)\b/;
+
+/** Distinct bigrams of content tokens per chunk → chunk-frequency map. */
+function bigramDf(chunks: DocChunk[]): Map<string, number> {
+  const df = new Map<string, number>();
+  for (const c of chunks) {
+    const t = tokenize(c.text);
+    const seen = new Set<string>();
+    for (let i = 0; i < t.length - 1; i++) seen.add(t[i] + " " + t[i + 1]);
+    for (const b of seen) df.set(b, (df.get(b) || 0) + 1);
+  }
+  return df;
+}
+
+const cleanPhrase = (b: string) =>
+  !PHRASE_NOISE.test(b) && !/\d/.test(b) && b.split(" ").every((w) => w.length > 3);
+
+/** The document's overall topic: the title-case run that opens the first
+ *  chunk (title pages / H1s), cross-checked against the text; falls back to
+ *  the filename, then to the most document-wide bigram. */
+function detectTopic(
+  chunks: DocChunk[],
+  name: string | undefined,
+  allDf: Map<string, number>,
+): string {
+  const inText = (phrase: string) => allDf.get(phrase.toLowerCase()) || 0;
+  const strip = (s: string) =>
+    s
+      .replace(/^(an?\s+)?(brief\s+)?(introduction|guide|primer)\s+to\s+/i, "")
+      .replace(/^(the\s+)?(complete\s+|beginner'?s\s+)?(guide|handbook|basics)\s+(to|of)\s+/i, "")
+      .trim();
+
+  // (a) leading title-case run of the first chunk, stopped at ALL-CAPS words
+  // ("SENIOR CONTRIBUTING AUTHORS") and capped at 8 words
+  const m = chunks[0]?.text.match(
+    /^((?:[A-Z][a-z][\w'-]*|to|of|the|and|in|for|on|a|an)(?:\s+(?:[A-Z][a-z][\w'-]*|to|of|the|and|in|for|on|a|an)){0,7})/,
+  );
+  if (m) {
+    const t = strip(m[1]);
+    const toks = tokenize(t);
+    // must be a real recurring subject, not a one-off heading
+    if (toks.length >= 1 && toks.length <= 4 && inText(toks.slice(0, 2).join(" ")) >= 3)
+      return t.toLowerCase();
+  }
+
+  // (b) filename: "introduction-intellectual-property.pdf" → best bigram of
+  // its tokens that the text itself uses often
+  if (name) {
+    const toks = tokenize(
+      name.replace(/\.[a-z0-9]+$/i, "").replace(/[-_./]+/g, " "),
+    ).filter((w) => !/^(intro|introduction|guide|notes|draft|final|copy|v\d+)$/.test(w));
+    let best = "";
+    let bestDf = 2; // require at least 3 occurrences
+    for (let i = 0; i < toks.length - 1; i++) {
+      const b = toks[i] + " " + toks[i + 1];
+      const d = inText(b);
+      if (d > bestDf) [best, bestDf] = [b, d];
+    }
+    if (best) return best;
+    if (toks.length === 1 && inText(toks[0])) return toks[0];
+  }
+
+  // (c) most widespread clean bigram, then unigram
+  const top = [...allDf.entries()]
+    .filter(([b]) => cleanPhrase(b))
+    .sort((a, b) => b[1] - a[1])[0];
+  if (top && top[1] >= 3) return top[0];
+  const freq = new Map<string, number>();
+  for (const c of chunks)
+    for (const w of tokenize(c.text)) freq.set(w, (freq.get(w) || 0) + 1);
+  const kw = [...freq.entries()]
+    .filter(([w]) => w.length > 3 && !PHRASE_NOISE.test(w))
+    .sort((a, b) => b[1] - a[1])[0];
+  return kw ? kw[0] : "";
+}
+
+/** Best clean bigram of a document region, scored for being frequent in the
+ *  region AND concentrated there (df²ᵣₑ𝓰ᵢₒₙ / df𝒹ₒ𝒸). */
+function regionPhrase(
+  region: DocChunk[],
+  allDf: Map<string, number>,
+  exclude: string[],
+): string {
+  const used = new Set(exclude.flatMap((p) => tokenize(p)));
+  const local = bigramDf(region);
+  const scored = [...local.entries()]
+    .filter(
+      ([b, d]) =>
+        d >= 2 && cleanPhrase(b) && !b.split(" ").some((w) => used.has(w)),
+    )
+    .map(([b, d]) => [b, (d * d) / (allDf.get(b) || 1)] as const)
+    .sort((a, b) => b[1] - a[1]);
+  return scored[0]?.[0] ?? "";
+}
+
+export function generateSuggestions(
+  chunks: DocChunk[],
+  name?: string,
+): string[] {
+  if (!chunks.length) return [];
+  const allDf = bigramDf(chunks);
   const out: string[] = [];
-  if (full(0)) out.push(`What is ${full(0)}?`);
-  const edge = graph.edges.find(
-    (e) => full(e.a) && full(e.b) && e.a !== e.b,
+
+  // 1 — the document's own subject
+  const topic = detectTopic(chunks, name, allDf);
+  if (topic) out.push(`What is ${topic}?`);
+
+  // 2 — a theme from the middle of the document
+  const mid = chunks.slice(
+    Math.floor(chunks.length * 0.35),
+    Math.ceil(chunks.length * 0.65),
   );
-  if (edge) out.push(`How does ${full(edge.a)} relate to ${full(edge.b)}?`);
-  const third = graph.nodes.find(
-    (n, i) => n.full && i !== 0 && i !== edge?.a && i !== edge?.b,
-  );
-  if (third) out.push(`What does it say about ${third.full}?`);
+  const midPhrase = regionPhrase(mid, allDf, [topic]);
+  if (midPhrase) out.push(`What does it say about ${midPhrase}?`);
+
+  // 3 — what the final section covers ("conclusion" only if the text has one)
+  const tail = chunks.slice(Math.floor(chunks.length * 0.88));
+  const hasConclusion = tail.some((c) => /\bconclusions?\b/i.test(c.text));
+  const tailPhrase = regionPhrase(tail, allDf, [topic, midPhrase]);
+  if (hasConclusion) out.push("What is the conclusion of the document?");
+  else if (tailPhrase)
+    out.push(`What does the final section say about ${tailPhrase}?`);
+
+  // entity / keyword fallback for anything still missing
   if (out.length < 3) {
-    // keyword fallback for documents with few capitalized entities
+    const graph = extractEntityGraph(chunks);
+    for (const n of graph.nodes) {
+      if (out.length >= 3) break;
+      const t = tokenize(n.full);
+      if (out.some((q) => t.some((w) => q.toLowerCase().includes(w)))) continue;
+      out.push(`What does it say about ${n.full}?`);
+    }
+  }
+  if (out.length < 3) {
     const freq = new Map<string, number>();
     for (const c of chunks)
-      for (const w of tokenize(c.text))
-        freq.set(w, (freq.get(w) || 0) + 1);
+      for (const w of tokenize(c.text)) freq.set(w, (freq.get(w) || 0) + 1);
     const kws = [...freq.entries()]
-      .filter(([w]) => w.length > 3)
-      .sort((a, b) => b[1] - a[1])
-      .map(([w]) => w);
-    for (const kw of kws) {
+      .filter(([w]) => w.length > 3 && !PHRASE_NOISE.test(w))
+      .sort((a, b) => b[1] - a[1]);
+    for (const [kw] of kws) {
       if (out.length >= 3) break;
       if (out.some((q) => q.toLowerCase().includes(kw))) continue;
-      out.push(
-        out.length === 0
-          ? `What is ${kw}?`
-          : `What does it say about ${kw}?`,
-      );
+      out.push(`What does it say about ${kw}?`);
     }
   }
   return out.slice(0, 3);

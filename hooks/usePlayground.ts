@@ -21,7 +21,7 @@ import {
   parseFile,
   type LoadedDoc,
 } from "@/lib/document";
-import { generateLlmAnswer } from "@/lib/llm";
+import { checkHealth, generateLlmAnswer } from "@/lib/llm";
 import { PipelineRenderer } from "@/lib/renderer";
 import {
   buildRealSources,
@@ -53,13 +53,21 @@ const INITIAL: PlaygroundState = {
   suggestions: SUGGESTIONS,
   degraded: false,
   genPhase: "idle",
+  generatorOffline: false,
 };
 
 // How long to wait for generated prose before giving up and showing the
-// offline extractive answer instead. Bounds the pathological case (hung or
-// very slow backend) to something a user will sit through; a healthy
-// generator streams its first token well inside this.
-const GEN_DEADLINE_MS = 6000;
+// offline extractive answer instead. Workers AI's time-to-first-token is
+// well under a second; Gemini (used for the sample) is both the slower
+// path and, in testing, a highly variable one — seven real calls against
+// gemini-3.5-flash for the same small prompt ranged 4.5-19.1s (network
+// transit to Google measured separately at ~0.2s, so this is inference
+// latency, not transit). No deadline short enough for good UX catches the
+// true tail, so 12s is a deliberate compromise: it catches most draws
+// while keeping the pathological case bounded. When it doesn't land in
+// time, showing the extractive answer with the EXTRACTIVE FALLBACK label
+// is the correct, designed-for outcome — not a bug to chase away.
+const GEN_DEADLINE_MS = 12000;
 
 export interface PlaygroundActions {
   loadSample: () => void;
@@ -131,6 +139,25 @@ export function usePlayground() {
       clearTimers();
     };
   }, [renderer, clearTimers]);
+
+  // Checked once at mount so a total generator outage shows up before the
+  // user asks anything, rather than only being discovered 6s into every
+  // query. A single exhausted provider isn't "offline" — the Worker itself
+  // falls through from Gemini to Workers AI — so this only trips when
+  // neither provider has capacity, or the Worker is unreachable at all.
+  useEffect(() => {
+    let cancelled = false;
+    checkHealth().then((status) => {
+      if (cancelled) return;
+      set({
+        generatorOffline: !status.ok || (!status.workersAiAvailable && !status.geminiAvailable),
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const runIndex = useCallback(() => {
     clearTimers();
@@ -233,6 +260,24 @@ export function usePlayground() {
               : retrieveBasic(doc.chunks, q);
       applyQueryToScene(scene, res);
       const sources = buildRealSources(rag, res, scene);
+
+      // The generator must only ever be handed passages that have a
+      // visible trace card — buildRealSources curates a smaller, mode-
+      // specific display (e.g. naive shows 3 of finalTop's up to 6 chunks),
+      // so sending finalTop wholesale would let the model cite a passage
+      // the user has no card for, rendering as dead "[5]" text instead of
+      // a clickable citation. Recompute each card's citation number to
+      // match its position in this exact list, so what the model numbers
+      // is what the UI can resolve.
+      const chunkById = new Map(doc.chunks.map((c) => [c.id, c]));
+      const citable = sources.filter(
+        (s): s is typeof s & { chunkId: number } =>
+          s.kind === "chunk" && !s.rejected && s.chunkId != null,
+      );
+      citable.forEach((s, i) => {
+        s.citation = i + 1;
+      });
+
       // The extractive answer resolves synchronously and is the fallback of
       // last resort. Real generation runs against it with a deadline: first
       // token wins, and if nothing arrives in time we show the extractive
@@ -276,11 +321,23 @@ export function usePlayground() {
       const deadline = setTimeout(() => release(extractive), GEN_DEADLINE_MS);
       timersRef.current.push(deadline);
 
+      const isSample = !!doc.isSample;
       generateLlmAnswer(
         {
           rag,
           query: q,
-          chunks: res.finalTop.map((s) => s.chunk),
+          doc: isSample ? "sample" : "upload",
+          // Sample: bare ids — the Worker resolves them against its own
+          // bundled copy (see worker/src/sample.ts). Anything else: full
+          // chunk objects, which always route to Workers AI regardless of
+          // this "doc" label. Either way, exactly `citable`, in order —
+          // see the comment above where citations were recomputed.
+          chunks: isSample
+            ? citable.map((s) => s.chunkId)
+            : citable.map((s) => {
+                const c = chunkById.get(s.chunkId)!;
+                return { id: c.id, page: c.page, text: c.text };
+              }),
         },
         (delta) => {
           if (seq !== querySeqRef.current) return;

@@ -36,18 +36,25 @@ npm run dev     # http://localhost:3000 (pass `-- --port 3100` to match .claude/
 
 The sample loads instantly: its chunks are precomputed at build time (`npm run preprocess:sample` regenerates `public/sample/*.chunks.json` from the PDF using the exact same chunking code the app runs), so choosing the sample skips the multi-second client-side PDF parse while still exercising the full retrieval pipeline. The original PDF is served alongside the app and previewable from the empty state ("preview PDF ↗") or by clicking the document name in the sidebar.
 
-Or drop in your own document: drag & drop, click to browse, or paste a URL (scraped via a reader proxy). PDFs are parsed client-side with `pdfjs-dist`; TXT/MD are read directly. The document is chunked, boilerplate (tables of contents, indexes, quiz blocks) is filtered out, and each of the four tabs runs a genuinely different retrieval strategy over the real chunks — TF-IDF-style lexical scoring, entity-graph boosting (Hybrid), grade-and-re-retrieve (Corrective), or a query-refinement loop (Agentic) — with real scores, snippets and an extractive answer. No API key required for this path; it's fully client-side and works on the deployed static site.
+Or drop in your own document: drag & drop, click to browse, or paste a URL (scraped via a reader proxy). PDFs are parsed client-side with `pdfjs-dist`; TXT/MD are read directly. The document is chunked, boilerplate (tables of contents, indexes, quiz blocks) is filtered out, and each of the four tabs runs a genuinely different retrieval strategy over the real chunks — TF-IDF-style lexical scoring, entity-graph boosting (Hybrid), grade-and-re-retrieve (Corrective), or a query-refinement loop (Agentic) — with real scores and snippets. No API key required for retrieval itself; it's fully client-side and works on the deployed static site.
 
-### Real LLM-generated answers (optional, local dev only)
+### Real, grounded, cited answers
 
-For a sharper answer than the offline extractive fallback, run a local proxy that calls the Gemini API with the same retrieved chunks as grounding context:
+Every public visitor gets an actual generated answer, not the extractive fallback — a small Cloudflare Worker (`worker/`) turns the retrieved chunks into a prompt, streams the response back over SSE, and the client renders `[1][2]`-style citations that scroll their source card into view on click. Two providers, chosen by which document is loaded:
+
+- **The bundled sample** routes to **Gemini** (better prose). The Worker ships its own copy of the sample's chunks and only ever accepts *chunk ids* for this path — never client-supplied text — so there's no way to spend Gemini quota generating over arbitrary content.
+- **Anything you upload or paste a URL for** routes to **Workers AI** (Llama), which has no data-training clause, so a private document's text never reaches a provider that might use it to improve their models.
+
+If neither provider has quota left for the day, or the Worker is unreachable, the app falls back to the offline extractive answer and says so (`EXTRACTIVE FALLBACK`) rather than failing silently. The whole thing runs on Cloudflare's free tier — see `worker/README.md` for the cost model, quota ladders, and deployment.
+
+For local development, run the Worker alongside the app:
 
 ```sh
-cp .env.example .env        # add your GEMINI_API_KEY
-npm run dev:llm             # in a second terminal, alongside `npm run dev`
+cp worker/.dev.vars.example worker/.dev.vars   # add your GEMINI_API_KEY + a random IP_HASH_SALT
+npm run dev:llm                                # wrangler dev, in a second terminal
 ```
 
-This never touches the deployed site. `output: "export"` (static site, no server) means a Next.js API route literally cannot exist in this build — so `server/llm-proxy.mjs` is a standalone Node process that the bundler never sees, holding the API key server-side. The client fetches `localhost:8787` with a short timeout and silently falls back to the extractive answer if the proxy isn't running, which is what happens for every real visitor of the public site — there is no code path by which the key can reach a browser bundle.
+`npm run dev` already defaults to `http://localhost:8787` for the Worker endpoint, so nothing else needs configuring locally.
 
 ## Stack & architecture
 
@@ -72,6 +79,11 @@ lib/
   steps.ts             per-architecture query step sequences (560 ms per step)
   data.ts              seeded demo data (60 chunk dots, 11-entity graph)
   constants.ts         design tokens, copy, scripted answers/sources
+  llm.ts               client for the generation Worker: SSE consumption,
+                       health check, never throws — always degrades cleanly
+worker/                standalone Cloudflare Worker — the only backend this
+                       app has, deployed independently of the static site;
+                       see worker/README.md
 ```
 
 React owns the state machine and DOM chrome; the renderer runs its own `requestAnimationFrame` loop and reads a mutable view object that React updates on state changes — so streaming answers and step timers never force per-frame React renders.

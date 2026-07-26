@@ -1,0 +1,10 @@
+# Copy to worker/.dev.vars (gitignored) for `wrangler dev`. In production
+# these are set with `wrangler secret put GEMINI_API_KEY` / `IP_HASH_SALT`,
+# never committed or put in wrangler.jsonc.
+
+# Google AI Studio key — https://aistudio.google.com/apikey
+GEMINI_API_KEY=
+
+# Any random string; salts the per-visitor IP hash so raw IPs are never
+# stored. Generate with: node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
+IP_HASH_SALT=

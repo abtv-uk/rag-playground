@@ -17,6 +17,13 @@ export interface LoadedDoc {
   chunks: DocChunk[];
   /** where the original document can be viewed (sample PDF) */
   sourceUrl?: string;
+  /** True only for the bundled sample — set exclusively by loadSampleDoc
+   *  below, never inferred elsewhere. This is a trust boundary: the
+   *  generation backend only serves Gemini requests that name the sample
+   *  by chunk id (see worker/src/sample.ts), and this flag is what lets
+   *  the client know it's allowed to send ids instead of full chunk text.
+   *  An uploaded document must never be able to set this. */
+  isSample?: boolean;
 }
 
 /** Progress hint shown in the dropzone while a document is being read. */
@@ -51,6 +58,7 @@ export async function loadSampleDoc(
     pages: data.pages,
     chunks: data.chunks,
     sourceUrl: SAMPLE_PDF_URL,
+    isSample: true,
   };
 }
 

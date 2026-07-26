@@ -7,3 +7,6 @@ next-env.d.ts
 .env*
 !.env.example
 .DS_Store
+worker/.dev.vars*
+!worker/.dev.vars.example
+worker/.wrangler/

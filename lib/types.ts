@@ -42,6 +42,9 @@ export interface LoadedDocInfo {
   pages: number;
   chunks: { id: number; page: number; text: string }[];
   sourceUrl?: string;
+  /** Set only by loadSampleDoc — see LoadedDoc in lib/document.ts for why
+   *  this is a trust boundary, not just a display flag. */
+  isSample?: boolean;
 }
 
 /** What the generation backend is doing right now. Drives the output-panel
@@ -75,4 +78,9 @@ export interface PlaygroundState {
    *  than generated prose — surfaced in the UI instead of failing silently. */
   degraded: boolean;
   genPhase: GenPhase;
+  /** True once the mount-time health check confirms the generation Worker
+   *  has no capacity left today (both providers exhausted, or unreachable).
+   *  Lets the UI say so before the first query, instead of only discovering
+   *  it 6s into every answer. */
+  generatorOffline: boolean;
 }

@@ -181,6 +181,19 @@ export default function OutputPanel({
                 ? "Load a document, then ask a question to watch the pipeline light up."
                 : "Ask a question to run the " + NAMES[state.rag] + " pipeline."}
             </div>
+            {state.generatorOffline && (
+              <div
+                style={{
+                  fontSize: 11,
+                  lineHeight: 1.5,
+                  color: "var(--faint)",
+                  maxWidth: 200,
+                  margin: "10px auto 0",
+                }}
+              >
+                generator offline — showing extractive answers
+              </div>
+            )}
           </div>
         )}
 

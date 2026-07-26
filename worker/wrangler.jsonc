@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rag-playground-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-26",
+
+  // Text generation for uploaded documents (no training-data clause on
+  // Workers AI, unlike Gemini's free tier — see src/sample.ts).
+  "ai": { "binding": "AI" },
+
+  "kv_namespaces": [
+    // daily neuron/call counters for both providers — see src/budget.ts
+    { "binding": "QUOTA", "id": "a31df3eee6a3444ca0e67a5ab68c17ac" },
+    // per-IP daily counter, keyed on a salted hash — see src/index.ts
+    { "binding": "RATE", "id": "23ce6c0bc49c4db2b698a6acc0cd7495" }
+  ],
+
+  // per-minute floor, ahead of the daily KV counter above. period is
+  // restricted by Cloudflare to 10 or 60 seconds.
+  "ratelimits": [
+    {
+      "name": "GENERATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 12, "period": 60 }
+    }
+  ],
+
+  "vars": {
+    // comma-separated hard allowlist checked in src/index.ts
+    "ALLOWED_ORIGINS": "https://abtv-uk.github.io,http://localhost:3100,http://localhost:3000"
+  },
+
+  "observability": { "enabled": true }
+
+  // Secrets (never in this file): GEMINI_API_KEY, IP_HASH_SALT.
+  // Local dev reads them from worker/.dev.vars (gitignored).
+  // Production: `wrangler secret put GEMINI_API_KEY` / `IP_HASH_SALT`.
+}

@@ -1,10 +1,8 @@
-// Client for the generation backend. Never throws — resolves `false` on any
-// failure (endpoint down, timeout, error response, abort) so callers can
+// Client for the generation Worker (worker/src/index.ts) — the only backend
+// this app has. Consumes the Worker's own SSE wire format (not either
+// upstream provider's — see worker/src/sse.ts) and never throws: any
+// failure resolves without further deltas and returns false, so callers
 // fall back to the offline extractive answer.
-//
-// Transport is currently a single JSON response, surfaced through the same
-// delta callback that token streaming will use, so swapping in SSE is a
-// change to this file only.
 
 import type { GenPhase, RagId } from "./types";
 
@@ -25,7 +23,60 @@ export interface LlmChunk {
 export interface GenerateRequest {
   rag: RagId;
   query: string;
-  chunks: LlmChunk[];
+  /** "sample" only when state.doc.isSample is true — see
+   *  worker/src/sample.ts for why the client can't just assert this for
+   *  arbitrary text. */
+  doc: "sample" | "upload";
+  /** Bare chunk ids for the sample (the Worker resolves them against its
+   *  own bundled copy); full {id,page,text} objects for anything else. */
+  chunks: number[] | LlmChunk[];
+}
+
+type WireEvent =
+  | { type: "delta"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+/** Consumes an SSE body, calling onDelta per delta frame, until the stream
+ *  signals "done"/"error" or simply closes. */
+async function consumeSse(
+  body: ReadableStream<Uint8Array>,
+  onDelta: (delta: string) => void,
+): Promise<{ gotDelta: boolean }> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let gotDelta = false;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        let evt: WireEvent;
+        try {
+          evt = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (evt.type === "delta" && evt.text) {
+          gotDelta = true;
+          onDelta(evt.text);
+        } else if (evt.type === "done" || evt.type === "error") {
+          return { gotDelta };
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return { gotDelta };
 }
 
 export async function generateLlmAnswer(
@@ -36,7 +87,6 @@ export async function generateLlmAnswer(
 ): Promise<boolean> {
   if (!req.chunks.length) return false;
 
-  // combine the caller's abort with our own timeout
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   signal.addEventListener("abort", onAbort, { once: true });
@@ -50,18 +100,45 @@ export async function generateLlmAnswer(
       body: JSON.stringify(req),
       signal: ac.signal,
     });
-    if (!res.ok) return false;
-    const data = await res.json();
-    const answer = typeof data.answer === "string" ? data.answer.trim() : "";
-    if (!answer) return false;
-    if (signal.aborted) return false;
+    if (!res.ok || !res.body) return false;
     onPhase("generating");
-    onDelta(answer);
-    return true;
+    const { gotDelta } = await consumeSse(res.body, onDelta);
+    return gotDelta;
   } catch {
-    return false; // endpoint down, network error, timeout, or abort
+    return false; // Worker down, network error, timeout, or abort
   } finally {
     clearTimeout(timer);
     signal.removeEventListener("abort", onAbort);
+  }
+}
+
+export interface HealthStatus {
+  ok: boolean;
+  workersAiAvailable: boolean;
+  geminiAvailable: boolean;
+}
+
+const OFFLINE_STATUS: HealthStatus = {
+  ok: false,
+  workersAiAvailable: false,
+  geminiAvailable: false,
+};
+
+/** Checked once at mount so the UI can say "generator offline" up front
+ *  instead of silently degrading 6s into every query. Never throws. */
+export async function checkHealth(): Promise<HealthStatus> {
+  try {
+    const res = await fetch(ENDPOINT + "/health", {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return OFFLINE_STATUS;
+    const data = await res.json();
+    return {
+      ok: !!data.ok,
+      workersAiAvailable: data.workersAi?.tier !== "exhausted",
+      geminiAvailable: data.gemini?.tier !== "exhausted",
+    };
+  } catch {
+    return OFFLINE_STATUS;
   }
 }

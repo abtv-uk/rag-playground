@@ -9,8 +9,14 @@
 
 import { ACCENTS } from "./constants";
 import type { DocChunk } from "./document";
+import { cosineRank, type DenseIndex } from "./embeddings";
 import type { SceneData } from "./scene";
 import type { RagId, Source } from "./types";
+
+export interface DenseOpts {
+  dense?: DenseIndex;
+  queryVec?: Float32Array;
+}
 
 const STOP = new Set(
   ("a an and are as at be but by for from has have if in into is it its of on or " +
@@ -32,6 +38,54 @@ export interface ScoredChunk {
   chunk: DocChunk;
   raw: number;
   score: number; // normalized 0..0.95
+  /** Background-normalized dense relevance (see backgroundStats below) —
+   *  present only when this chunk was scored against embeddings. Never
+   *  threshold on raw cosine or on `score` when this is set; use
+   *  passScore() instead. */
+  relevance?: number;
+  /** Raw cosine similarity, preserved through RRF fusion (where `.raw`
+   *  becomes the fused RRF weight, not cosine) specifically so
+   *  passScore()'s absolute floor has something to test — see its
+   *  docstring for why this exists alongside `relevance`. */
+  cosine?: number;
+}
+
+// Below this raw cosine, nothing in the document is a genuine semantic
+// match — see passScore()'s docstring for why relevance alone can never
+// catch this case. Empirically calibrated against bge-base-en-v1.5 on the
+// bundled sample: real on-topic queries topped out ~0.77-0.79 cosine; a
+// deliberately off-topic control query ("how does weather affect crop
+// yields" against a legal textbook) topped out ~0.52. This floor sits with
+// margin on both sides of that gap. Expect to retune if the embedding
+// model changes; Phase 3's LLM-based grader is the intended real fix —
+// this is a best-effort placeholder until then.
+const ABSOLUTE_COSINE_FLOOR = 0.55;
+
+/** What corrective grading (and the grade-panel visual) should actually
+ *  threshold against: relevance when dense scoring produced one, otherwise
+ *  the existing TF-IDF-calibrated `score`. Exists because PASS_THRESHOLD
+ *  (0.45) is calibrated for TF-IDF's 0..0.95 spread — bge cosines cluster
+ *  ~0.6-0.85 for everything, so thresholding raw cosine directly would
+ *  never reject anything.
+ *
+ *  Background-normalized relevance alone isn't sufficient, though: a
+ *  top-ranked candidate is, by construction, ABOVE its own document's
+ *  background mean, so its z-score is virtually always positive —  and
+ *  sigmoid(positive) is mathematically always > 0.5, comfortably above
+ *  PASS_THRESHOLD's 0.45. That makes it impossible for relevance alone to
+ *  ever reject a top-ranked chunk, no matter how irrelevant the whole
+ *  document actually is to the query (verified empirically against the
+ *  bundled sample: an off-topic control query still scored 0.55-0.76
+ *  relevance at every divisor tried). The absolute floor below is what
+ *  actually catches that case; relevance remains useful as a *display*
+ *  signal — it still differentiates a strong match from a merely adequate
+ *  one once both clear the floor. */
+export function passScore(s: ScoredChunk): number {
+  if (s.relevance != null) {
+    if (s.cosine != null && s.cosine < ABSOLUTE_COSINE_FLOOR) return 0;
+    return s.relevance;
+  }
+  return s.score;
 }
 
 export interface RetrievalResult {
@@ -131,13 +185,122 @@ function finish(
   };
 }
 
+// ---------- dense scoring & fusion ----------
+
+/** Mean/stddev of a query's cosine similarity against every chunk in the
+ *  document. cosineRank already computes cosine for every row (there's no
+ *  cheaper subset to sample once that work is done), so this uses the full
+ *  distribution rather than the stride-sampled 96 the original design
+ *  sketch assumed — strictly more accurate at the same cost. */
+function backgroundStats(ranked: { cos: number }[]): { mu: number; sigma: number } {
+  const n = ranked.length || 1;
+  let mu = 0;
+  for (const r of ranked) mu += r.cos;
+  mu /= n;
+  let variance = 0;
+  for (const r of ranked) variance += (r.cos - mu) ** 2;
+  variance /= n;
+  return { mu, sigma: Math.sqrt(variance) };
+}
+
+function sigmoid(x: number): number {
+  return 1 / (1 + Math.exp(-x));
+}
+
+/** Dense-only ranking: cosine similarity against every chunk, converted to
+ *  a background-normalized relevance ("N standard deviations more similar
+ *  to this query than a random chunk in this document") so PASS_THRESHOLD
+ *  stays meaningful — see passScore(). `raw` is left as the plain cosine;
+ *  callers that mix this with a differently-scaled list (lexical TF-IDF,
+ *  RRF weights) must rebase before merging — see fuseWithDense. */
+function denseScoreChunks(
+  chunks: DocChunk[],
+  dense: DenseIndex,
+  queryVec: Float32Array,
+): ScoredChunk[] {
+  const ranked = cosineRank(dense, queryVec);
+  const { mu, sigma } = backgroundStats(ranked);
+  const sigmaSafe = sigma || 1e-6;
+  return ranked
+    .map(({ i, cos }): ScoredChunk | null => {
+      const chunk = chunks[i];
+      if (!chunk) return null;
+      return {
+        chunk,
+        raw: cos,
+        score: 0,
+        relevance: sigmoid((cos - mu) / sigmaSafe / 2.2),
+        cosine: cos,
+      };
+    })
+    .filter((s): s is ScoredChunk => !!s);
+}
+
+/** Reciprocal Rank Fusion: combines ranked lists by position, not raw
+ *  score magnitude, so lists on incomparable scales (lexical TF-IDF, dense
+ *  cosine, graph-boost membership) combine fairly. */
+function rrf(lists: { id: number }[][], k = 60): Map<number, number> {
+  const scores = new Map<number, number>();
+  for (const list of lists) {
+    list.forEach(({ id }, rank) => {
+      scores.set(id, (scores.get(id) || 0) + 1 / (k + rank + 1));
+    });
+  }
+  return scores;
+}
+
+/** RRF-fuses a lexical ranking with dense retrieval (plus any extra ranked
+ *  lists, e.g. hybrid's graph-boost membership), returning an
+ *  already-normalized (0..0.95 `.score`) result with dense `.relevance`
+ *  carried through. The returned list's `.raw` is the RRF weight — a
+ *  self-consistent scale, but NOT comparable to a fresh lexical pass's TF-IDF
+ *  `.raw`. Callers that later merge this with such a pass (corrective's
+ *  re-retrieval, agentic's second pass) must rebase on `.score` — see the
+ *  comment at each call site for why mixing raw scales there would silently
+ *  let one list's magnitude swamp the other's after the next normalize(). */
+function fuseWithDense(
+  chunks: DocChunk[],
+  lexical: ScoredChunk[],
+  dense: DenseIndex,
+  queryVec: Float32Array,
+  extraLists: { id: number }[][] = [],
+): ScoredChunk[] {
+  const denseScored = denseScoreChunks(chunks, dense, queryVec);
+  const byIdChunk = new Map(chunks.map((c) => [c.id, c]));
+  const relevanceById = new Map(denseScored.map((s) => [s.chunk.id, s.relevance]));
+  const cosineById = new Map(denseScored.map((s) => [s.chunk.id, s.cosine]));
+  const fused = rrf([
+    lexical.map((s) => ({ id: s.chunk.id })),
+    denseScored.map((s) => ({ id: s.chunk.id })),
+    ...extraLists,
+  ]);
+  const ranked = [...fused.entries()]
+    .map(([id, raw]): ScoredChunk | null => {
+      const chunk = byIdChunk.get(id);
+      if (!chunk) return null;
+      return { chunk, raw, score: 0, relevance: relevanceById.get(id), cosine: cosineById.get(id) };
+    })
+    .filter((s): s is ScoredChunk => !!s)
+    .sort((a, b) => b.raw - a.raw);
+  return normalize(ranked);
+}
+
 // ---------- the four strategies ----------
 
 export function retrieveBasic(
   chunks: DocChunk[],
   query: string,
+  opts?: DenseOpts,
 ): RetrievalResult {
   const qTerms = [...new Set(tokenize(query))];
+  // "basic vector RAG" means dense-only — when embeddings are available,
+  // that's the real naive baseline; lexical is the fallback when they
+  // aren't (quota exhausted, Worker unreachable, embed failure).
+  if (opts?.dense && opts.queryVec) {
+    const ranked = normalize(denseScoreChunks(chunks, opts.dense, opts.queryVec));
+    const initialTop = ranked.slice(0, 6).map((s) => ({ ...s }));
+    return finish(ranked, qTerms, { initialTop, finalTop: ranked.slice(0, 6) });
+  }
   const ranked = scoreChunks(chunks, qTerms);
   const initialTop = ranked.slice(0, 6);
   return finish(ranked, qTerms, { initialTop });
@@ -152,6 +315,7 @@ export function retrieveHybrid(
   chunks: DocChunk[],
   query: string,
   graph: GraphForRetrieval,
+  opts?: DenseOpts,
 ): RetrievalResult {
   const qTerms = [...new Set(tokenize(query))];
   const lexical = scoreChunks(chunks, qTerms);
@@ -172,21 +336,32 @@ export function retrieveHybrid(
   for (const i of active)
     for (const id of graph.nodes[i].chunkIds || []) boostChunkIds.add(id);
 
-  const maxRaw = lexical[0]?.raw || 1;
-  const byId = new Map(lexical.map((s) => [s.chunk.id, s]));
-  // boost lexical hits; graph-only chunks enter the ranking at the boost floor
-  for (const id of boostChunkIds) {
-    const hit = byId.get(id);
-    if (hit) hit.raw += 0.35 * maxRaw;
-    else {
-      const chunk = chunks.find((c) => c.id === id);
-      if (chunk) lexical.push({ chunk, raw: 0.35 * maxRaw, score: 0 });
+  let finalRanked: ScoredChunk[];
+  if (opts?.dense && opts.queryVec) {
+    // three-way fusion: lexical, dense, and graph-boost membership as a
+    // third ranked signal — strengthens hybrid's story rather than
+    // weakening it once real embeddings exist.
+    const graphList = [...boostChunkIds].map((id) => ({ id }));
+    finalRanked = fuseWithDense(chunks, lexical, opts.dense, opts.queryVec, [graphList]);
+  } else {
+    // lexical-only fallback: boost lexical hits directly (unchanged from
+    // before dense retrieval existed)
+    const maxRaw = lexical[0]?.raw || 1;
+    const byId = new Map(lexical.map((s) => [s.chunk.id, s]));
+    for (const id of boostChunkIds) {
+      const hit = byId.get(id);
+      if (hit) hit.raw += 0.35 * maxRaw;
+      else {
+        const chunk = chunks.find((c) => c.id === id);
+        if (chunk) lexical.push({ chunk, raw: 0.35 * maxRaw, score: 0 });
+      }
     }
+    lexical.sort((a, b) => b.raw - a.raw);
+    finalRanked = normalize(lexical);
   }
-  lexical.sort((a, b) => b.raw - a.raw);
-  const finalTop = normalize(lexical).slice(0, 6);
+  const finalTop = finalRanked.slice(0, 6);
   return {
-    ...finish(lexical, qTerms, { initialTop, finalTop }),
+    ...finish(finalRanked, qTerms, { initialTop, finalTop }),
     graphBoosted: [...active].slice(0, 6),
     boostedChunkIds: boostChunkIds,
   };
@@ -195,13 +370,22 @@ export function retrieveHybrid(
 export function retrieveCorrective(
   chunks: DocChunk[],
   query: string,
+  opts?: DenseOpts,
 ): RetrievalResult {
   const qTerms = [...new Set(tokenize(query))];
-  const ranked = normalize(scoreChunks(chunks, qTerms));
+  const lexical = normalize(scoreChunks(chunks, qTerms));
+  const ranked =
+    opts?.dense && opts.queryVec
+      ? fuseWithDense(chunks, lexical, opts.dense, opts.queryVec)
+      : lexical;
+
   const initialTop = ranked.slice(0, 6).map((s) => ({ ...s }));
   const graded = ranked.slice(0, 5);
-  const rejected = graded.filter((s) => s.score < PASS_THRESHOLD);
-  const passing = graded.filter((s) => s.score >= PASS_THRESHOLD);
+  // never threshold on raw cosine — passScore() prefers the
+  // background-normalized relevance when dense scoring produced one; see
+  // its docstring for why PASS_THRESHOLD would otherwise pass everything
+  const rejected = graded.filter((s) => passScore(s) < PASS_THRESHOLD);
+  const passing = graded.filter((s) => passScore(s) >= PASS_THRESHOLD);
   if (!rejected.length) {
     return finish(ranked, qTerms, {
       initialTop,
@@ -210,17 +394,27 @@ export function retrieveCorrective(
       replacements: [],
     });
   }
-  // re-retrieve with query expanded by terms from the chunks that passed
+  // re-retrieve with query expanded by terms from the chunks that passed —
+  // lexical PRF drives expansion even under dense retrieval, since it's
+  // about vocabulary the corpus shares, not vector geometry
   const trusted = passing.length ? passing : ranked.slice(0, 2);
   const expansion = prfTerms(trusted, qTerms, 3, chunks);
-  const secondPass = scoreChunks(chunks, [...qTerms, ...expansion]);
+  const secondPass = normalize(scoreChunks(chunks, [...qTerms, ...expansion]));
   const excluded = new Set(graded.map((s) => s.chunk.id));
   const replacements = secondPass
     .filter((s) => !excluded.has(s.chunk.id))
     .slice(0, Math.max(rejected.length, 1));
-  const merged = [...passing, ...replacements].sort((a, b) => b.raw - a.raw);
+  // `passing` may carry RRF-fused `.raw` (dense path) while `replacements`
+  // is always fresh lexical TF-IDF `.raw` — the two scales aren't
+  // comparable, so sorting/renormalizing on raw would let whichever list
+  // happens to have larger numbers swamp the other. `.score` is the one
+  // scale both are guaranteed to share (each was independently normalized
+  // to 0..0.95 above); rebase `.raw` onto it before the merge.
+  const merged = [...passing, ...replacements]
+    .map((s) => ({ ...s, raw: s.score }))
+    .sort((a, b) => b.raw - a.raw);
   const finalTop = normalize(merged).slice(0, 6);
-  return finish([...merged], qTerms, {
+  return finish(merged, qTerms, {
     initialTop,
     finalTop,
     rejected,
@@ -231,9 +425,15 @@ export function retrieveCorrective(
 export function retrieveAgentic(
   chunks: DocChunk[],
   query: string,
+  opts?: DenseOpts,
 ): RetrievalResult {
   const qTerms = [...new Set(tokenize(query))];
-  const pass1 = normalize(scoreChunks(chunks, qTerms));
+  const lexical = normalize(scoreChunks(chunks, qTerms));
+  const pass1 =
+    opts?.dense && opts.queryVec
+      ? fuseWithDense(chunks, lexical, opts.dense, opts.queryVec)
+      : lexical;
+
   const initialTop = pass1.slice(0, 6).map((s) => ({ ...s }));
   const refinedTerms = prfTerms(pass1.slice(0, 2), qTerms, 3, chunks);
   if (!refinedTerms.length) {
@@ -243,14 +443,19 @@ export function retrieveAgentic(
       refinedTerms: [],
     });
   }
-  const pass2 = scoreChunks(chunks, [...qTerms, ...refinedTerms]);
-  // merge both passes, keeping each chunk's best raw score
+  const pass2 = normalize(scoreChunks(chunks, [...qTerms, ...refinedTerms]));
+  // merge both passes, keeping each chunk's best-scoring entry. Compared
+  // on `.score`, not `.raw` — pass1 may be RRF-fused (dense path) while
+  // pass2 is always fresh lexical TF-IDF, and those scales aren't
+  // comparable (see the identical situation in retrieveCorrective above).
   const byId = new Map<number, ScoredChunk>();
   for (const s of [...pass1, ...pass2]) {
     const prev = byId.get(s.chunk.id);
-    if (!prev || s.raw > prev.raw) byId.set(s.chunk.id, { ...s });
+    if (!prev || s.score > prev.score) byId.set(s.chunk.id, s);
   }
-  const merged = [...byId.values()].sort((a, b) => b.raw - a.raw);
+  const merged = [...byId.values()]
+    .map((s) => ({ ...s, raw: s.score }))
+    .sort((a, b) => b.raw - a.raw);
   const finalTop = normalize(merged).slice(0, 6);
   return finish(merged, qTerms, { initialTop, finalTop, refinedTerms });
 }

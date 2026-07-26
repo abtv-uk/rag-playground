@@ -98,9 +98,16 @@ export default function RagPlayground() {
   // --- captions ---
   const chunkCount = state.doc ? state.doc.chunks.length : 64;
   const pageCount = state.doc?.pages ?? 15;
+  const stageCaptions = indexCaptions(state.rag, pageCount, chunkCount);
+  // Stage 2 is "embedding chunks → 768-d" — genuinely true now, so swap in
+  // real progress when a background embed is running instead of the
+  // generic canned line.
+  if (state.idxStage === 2 && state.embedProgress) {
+    stageCaptions[2] =
+      `INDEXING · embedding ${state.embedProgress.done} / ${state.embedProgress.total} chunks → 768-d`;
+  }
   const captionMap: Partial<Record<typeof state.phase, string>> = {
-    indexing:
-      indexCaptions(state.rag, pageCount, chunkCount)[state.idxStage] ?? "",
+    indexing: stageCaptions[state.idxStage] ?? "",
     querying: QUERY_CAPTIONS[state.rag],
     answered: "TRACE · " + NAMES[state.rag] + " · " + lastQuery,
   };

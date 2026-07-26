@@ -4,6 +4,8 @@
 // contents, indexes, page-number runs, bibliographies) and samples across the
 // whole document so late chapters are represented, not just the opening pages.
 
+import { decodeVectorBin, type DenseIndex } from "./embeddings";
+
 export interface DocChunk {
   id: number;
   page: number;
@@ -24,6 +26,15 @@ export interface LoadedDoc {
    *  the client know it's allowed to send ids instead of full chunk text.
    *  An uploaded document must never be able to set this. */
   isSample?: boolean;
+  /** Dense embeddings for this document's chunks, row i ↔ chunks[i] (chunk
+   *  ids are dense/1-based so this always holds — see chunkPages below).
+   *  Precomputed for the sample; embedded once in the background for
+   *  uploads (hooks/usePlayground.ts mutates this in place after adopting
+   *  the doc, mirroring the existing renderer.view mutation pattern).
+   *  Absent — never a rejected/degraded state, just absent — whenever
+   *  embedding hasn't finished yet or failed; every retrieval mode already
+   *  falls back to lexical-only when this is undefined. */
+  dense?: DenseIndex;
 }
 
 /** Progress hint shown in the dropzone while a document is being read. */
@@ -40,18 +51,36 @@ export const SAMPLE_PDF_URL =
   BASE + "/sample/introduction-intellectual-property.pdf";
 const SAMPLE_CHUNKS_URL =
   BASE + "/sample/introduction-intellectual-property.chunks.json";
+const SAMPLE_VECTORS_URL =
+  BASE + "/sample/introduction-intellectual-property.vectors.bin";
 
 /** The bundled sample (an OpenStax open-licensed textbook) ships with
  *  precomputed chunks — loading it is a small JSON fetch instead of a
- *  multi-second client-side parse of the 201-page PDF. Regenerate the JSON
- *  with `npm run preprocess:sample` if the PDF changes. */
+ *  multi-second client-side parse of the 201-page PDF — and precomputed
+ *  embeddings, so the sample costs zero embedding neurons no matter how
+ *  much traffic it gets. Regenerate both with `npm run preprocess:sample`
+ *  if the PDF changes. */
 export async function loadSampleDoc(
   onProgress?: ProgressFn,
 ): Promise<LoadedDoc> {
   onProgress?.("loading preprocessed sample…");
-  const res = await fetch(SAMPLE_CHUNKS_URL);
+  const [res, vecRes] = await Promise.all([
+    fetch(SAMPLE_CHUNKS_URL),
+    fetch(SAMPLE_VECTORS_URL),
+  ]);
   if (!res.ok) throw new Error("sample data missing — HTTP " + res.status);
   const data = await res.json();
+  // The vectors sidecar is best-effort: a missing/corrupt file degrades to
+  // lexical-only retrieval rather than failing the whole document load —
+  // the same seam every other embedding failure already falls back through.
+  let dense: DenseIndex | undefined;
+  if (vecRes.ok) {
+    try {
+      dense = decodeVectorBin(await vecRes.arrayBuffer());
+    } catch {
+      dense = undefined;
+    }
+  }
   return {
     name: data.name,
     sizeLabel: data.sizeLabel,
@@ -59,6 +88,7 @@ export async function loadSampleDoc(
     chunks: data.chunks,
     sourceUrl: SAMPLE_PDF_URL,
     isSample: true,
+    dense,
   };
 }
 

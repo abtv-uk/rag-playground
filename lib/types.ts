@@ -1,3 +1,5 @@
+import type { DenseIndex } from "./embeddings";
+
 export type RagId = "naive" | "hybrid" | "corrective" | "agentic";
 
 export type Phase = "empty" | "indexing" | "ready" | "querying" | "answered";
@@ -45,6 +47,8 @@ export interface LoadedDocInfo {
   /** Set only by loadSampleDoc — see LoadedDoc in lib/document.ts for why
    *  this is a trust boundary, not just a display flag. */
   isSample?: boolean;
+  /** See LoadedDoc.dense in lib/document.ts. */
+  dense?: DenseIndex;
 }
 
 /** What the generation backend is doing right now. Drives the output-panel
@@ -83,4 +87,8 @@ export interface PlaygroundState {
    *  Lets the UI say so before the first query, instead of only discovering
    *  it 6s into every answer. */
   generatorOffline: boolean;
+  /** Live progress while an uploaded document's chunks are being embedded
+   *  in the background (the sample never sets this — it ships pre-embedded).
+   *  Null once embedding finishes or isn't running. */
+  embedProgress: { done: number; total: number } | null;
 }

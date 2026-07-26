@@ -26,6 +26,14 @@ export const WORKERS_AI_MODELS: Record<Exclude<WorkersAiTier, "exhausted">, stri
   downshift: "@cf/meta/llama-3.2-1b-instruct",
 };
 
+// @cf/baai/bge-base-en-v1.5 pricing: $0.067 / M input tokens. Neurons are
+// Workers AI's unified cost unit ($0.011 / 1,000 neurons), so
+// neurons-per-token = (0.067 / 1000) / 0.011 * 1000 = 6.09 neurons per 1k
+// tokens, i.e. 6.09/1000 per token. Used to record embedding's *actual*
+// reported cost (from the response's usage.prompt_tokens) against the same
+// daily ladder generation draws on — both spend the same Workers AI budget.
+export const BGE_NEURONS_PER_TOKEN = 6.09 / 1000;
+
 export const GEMINI_MODELS: Record<Exclude<GeminiTier, "exhausted">, string> = {
   flash: "gemini-3.5-flash",
   "flash-lite": "gemini-3.5-flash-lite",

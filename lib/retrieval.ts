@@ -742,13 +742,20 @@ export function buildRealSources(
   if (rag === "corrective") {
     const cards: Source[] = [];
     (res.rejected ?? []).slice(0, 1).forEach((s) => {
+      // Report the number that actually drove the rejection, not `.score` —
+      // under dense retrieval `.score` is the normalized RRF weight, so the
+      // top-ranked chunk always reads 0.95 and the card would claim "graded
+      // 0.95 — below threshold". Same reason scene.ts's grade panel uses
+      // passScore(); the bar keeps a floor of 0.05 so a hard 0 (cosine below
+      // ABSOLUTE_COSINE_FLOOR) still renders as a visible sliver.
+      const graded = passScore(s);
       cards.push({
         kind: "reject",
         label: "chunk #" + s.chunk.id,
         meta: "rejected",
-        score: s.score.toFixed(2),
-        scoreN: s.score,
-        snippet: `graded ${s.score.toFixed(2)} — below threshold, re-retrieval triggered`,
+        score: graded.toFixed(2),
+        scoreN: Math.max(0.05, graded),
+        snippet: `graded ${graded.toFixed(2)} — below threshold, re-retrieval triggered`,
         color: A,
         rejected: true,
         chunkId: s.chunk.id,

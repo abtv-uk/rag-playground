@@ -2,6 +2,7 @@
 // sse.ts). Gemini and Workers AI use two different chunk shapes on the
 // wire — normalizing here means neither leaks past this file.
 import {
+  AUX_MODEL,
   GEMINI_MODELS,
   WORKERS_AI_MODELS,
   recordWorkersAiSpend,
@@ -87,6 +88,98 @@ export function streamWorkersAi(
       ctx.waitUntil(recordWorkersAiSpend(env.QUOTA, totalNeurons || 20));
     },
   });
+}
+
+// ---------- auxiliary JSON reasoning (grading, and later planning) ----------
+
+const AUX_MAX_TOKENS = 500;
+// Near-zero: grading is a classification, and letting a 1B model be
+// creative about it is exactly how you get invented justifications.
+const AUX_TEMPERATURE = 0.1;
+// Fallback when the response carries no usage.neurons, mirroring the
+// stream path's `|| 20`. Lower because this is the 1B model on a short
+// prompt — over-charging the ladder would refuse service early.
+const AUX_FALLBACK_NEURONS = 8;
+
+/** A 1B model asked for JSON will sometimes still wrap it in prose, or open
+ *  with a markdown fence, even under JSON mode. Pull out the first balanced
+ *  object rather than trusting the whole string to parse — cheaper and far
+ *  more reliable than a retry, which would double this call's latency
+ *  inside an already latency-critical serial step. */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "");
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // fall through to brace scanning
+  }
+  const start = trimmed.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < trimmed.length; i++) {
+    const c = trimmed[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (c === '"') inString = !inString;
+    else if (!inString && c === "{") depth++;
+    else if (!inString && c === "}" && --depth === 0) {
+      try {
+        return JSON.parse(trimmed.slice(start, i + 1));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+/** Runs the 1B aux model for a structured answer. Returns the raw parsed
+ *  value (callers validate its shape — see index.ts) or null on any
+ *  failure, so an aux step can never fail a request: every caller is
+ *  expected to degrade to its own non-LLM behavior instead. */
+export async function runAuxJson(
+  env: Env,
+  ctx: ExecutionContext,
+  prompt: BuiltPrompt,
+): Promise<unknown | null> {
+  let result: any;
+  try {
+    result = await env.AI.run(AUX_MODEL as never, {
+      messages: [
+        { role: "system", content: prompt.system },
+        { role: "user", content: prompt.user },
+      ],
+      max_tokens: AUX_MAX_TOKENS,
+      temperature: AUX_TEMPERATURE,
+      // json_object, NOT json_schema: the 1B aux model rejects schema mode
+      // outright (Workers AI error 5025). Even json_object is only a hint
+      // here — it is accepted but not enforced for this model — so the real
+      // guarantees are the explicit format contract in the prompt and the
+      // extractJson fallback plus per-field validation downstream.
+      response_format: { type: "json_object" },
+    } as never);
+  } catch {
+    return null;
+  }
+
+  const neurons = typeof result?.usage?.neurons === "number" ? result.usage.neurons : 0;
+  ctx.waitUntil(recordWorkersAiSpend(env.QUOTA, neurons || AUX_FALLBACK_NEURONS));
+
+  // JSON mode may hand back an already-parsed object; without it, a string.
+  // json_object mode hands back an already-parsed object on the 8B model;
+  // on models where it's only a hint, a string that may be wrapped in prose.
+  const raw = result?.response;
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw === "string") return extractJson(raw);
+  return null;
 }
 
 /** Connects to Gemini eagerly and returns a ready-to-consume stream only on

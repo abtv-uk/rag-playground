@@ -48,6 +48,13 @@ export interface ScoredChunk {
    *  passScore()'s absolute floor has something to test — see its
    *  docstring for why this exists alongside `relevance`. */
   cosine?: number;
+  /** A real model verdict from POST /grade, present only on the chunks
+   *  corrective mode actually graded (pass 1's top 5) and only when the
+   *  grader was reachable. When set it *replaces* the cosine floor as the
+   *  pass/reject decision — see gradedPass(). `why` is the model's own
+   *  wording, shown to the user verbatim on the reject card, and may be
+   *  empty if the model omitted it. */
+  verdict?: { relevant: boolean; why: string };
 }
 
 // Below this raw cosine, nothing in the document is a genuine semantic
@@ -86,6 +93,27 @@ export function passScore(s: ScoredChunk): number {
     return s.relevance;
   }
   return s.score;
+}
+
+/** Whether a graded chunk passes — the single place that decides. A real
+ *  model verdict wins outright when present; otherwise this falls back to
+ *  the cosine-floor heuristic, which is still what runs whenever the grader
+ *  is unreachable, quota-exhausted, or simply wasn't asked (every mode
+ *  except corrective). */
+export function gradedPass(s: ScoredChunk): boolean {
+  if (s.verdict) return s.verdict.relevant;
+  return passScore(s) >= PASS_THRESHOLD;
+}
+
+/** Bar length for the grade panel and trace cards. Under a model verdict
+ *  there is no continuous score to show — the grader returns a boolean, not
+ *  a confidence — so this reports the verdict itself rather than dressing a
+ *  cosine up as the thing that made the decision. (Showing the underlying
+ *  score next to a model rejection is exactly the mismatch that made the
+ *  reject card read "graded 0.95 — below threshold".) */
+export function gradedBar(s: ScoredChunk): number {
+  if (s.verdict) return s.verdict.relevant ? 0.9 : 0.12;
+  return Math.max(0.05, passScore(s));
 }
 
 export interface RetrievalResult {
@@ -367,25 +395,65 @@ export function retrieveHybrid(
   };
 }
 
-export function retrieveCorrective(
+/** Corrective's first pass, split out so the caller can send `graded` to
+ *  POST /grade and hand the verdicts back to retrieveCorrective. Kept
+ *  separate (rather than making retrieval async) for the same reason query
+ *  embedding is: retrieval stays synchronous and pure, and the one network
+ *  step lives in the hook — see hooks/usePlayground.ts. */
+export interface CorrectivePass1 {
+  ranked: ScoredChunk[];
+  /** The chunks to grade: pass 1's top 5, in order. Verdict `i` refers to
+   *  position `i` here. */
+  graded: ScoredChunk[];
+}
+
+export function correctivePass1(
   chunks: DocChunk[],
   query: string,
   opts?: DenseOpts,
-): RetrievalResult {
+): CorrectivePass1 {
   const qTerms = [...new Set(tokenize(query))];
   const lexical = normalize(scoreChunks(chunks, qTerms));
   const ranked =
     opts?.dense && opts.queryVec
       ? fuseWithDense(chunks, lexical, opts.dense, opts.queryVec)
       : lexical;
+  return { ranked, graded: ranked.slice(0, 5) };
+}
+
+export interface GradeVerdict {
+  i: number;
+  relevant: boolean;
+  why: string;
+}
+
+/** Attaches model verdicts to pass 1's graded chunks, by position. Mutates
+ *  in place because `graded` holds the same object references as `ranked`,
+ *  which is what carries the verdicts through to the final result and the
+ *  trace cards. A verdict whose call failed is simply absent — that chunk
+ *  keeps the cosine-floor heuristic rather than being rejected by default. */
+export function applyGradeVerdicts(p1: CorrectivePass1, verdicts: GradeVerdict[]): void {
+  for (const v of verdicts) {
+    const target = p1.graded[v.i];
+    if (target) target.verdict = { relevant: v.relevant, why: v.why };
+  }
+}
+
+export function retrieveCorrective(
+  chunks: DocChunk[],
+  query: string,
+  opts?: DenseOpts,
+  pass1?: CorrectivePass1,
+): RetrievalResult {
+  const qTerms = [...new Set(tokenize(query))];
+  const { ranked, graded } = pass1 ?? correctivePass1(chunks, query, opts);
 
   const initialTop = ranked.slice(0, 6).map((s) => ({ ...s }));
-  const graded = ranked.slice(0, 5);
-  // never threshold on raw cosine — passScore() prefers the
-  // background-normalized relevance when dense scoring produced one; see
-  // its docstring for why PASS_THRESHOLD would otherwise pass everything
-  const rejected = graded.filter((s) => passScore(s) < PASS_THRESHOLD);
-  const passing = graded.filter((s) => passScore(s) >= PASS_THRESHOLD);
+  // gradedPass() prefers a real model verdict and falls back to the cosine
+  // floor — never a raw threshold on `.score`, which under dense retrieval
+  // is an RRF weight and would pass everything (see passScore()).
+  const rejected = graded.filter((s) => !gradedPass(s));
+  const passing = graded.filter((s) => gradedPass(s));
   if (!rejected.length) {
     return finish(ranked, qTerms, {
       initialTop,
@@ -742,20 +810,24 @@ export function buildRealSources(
   if (rag === "corrective") {
     const cards: Source[] = [];
     (res.rejected ?? []).slice(0, 1).forEach((s) => {
-      // Report the number that actually drove the rejection, not `.score` —
-      // under dense retrieval `.score` is the normalized RRF weight, so the
-      // top-ranked chunk always reads 0.95 and the card would claim "graded
-      // 0.95 — below threshold". Same reason scene.ts's grade panel uses
-      // passScore(); the bar keeps a floor of 0.05 so a hard 0 (cosine below
-      // ABSOLUTE_COSINE_FLOOR) still renders as a visible sliver.
+      // Whatever is shown here must be the thing that actually drove the
+      // rejection. With a model verdict that's the model's own sentence,
+      // and there is no meaningful number to print — showing the cosine
+      // beside a model rejection is what made this card once read "graded
+      // 0.95 — below threshold". Without a verdict, fall back to the
+      // heuristic and print the score it actually thresholded on.
       const graded = passScore(s);
+      const why = s.verdict?.why?.trim();
       cards.push({
         kind: "reject",
         label: "chunk #" + s.chunk.id,
         meta: "rejected",
-        score: graded.toFixed(2),
-        scoreN: Math.max(0.05, graded),
-        snippet: `graded ${graded.toFixed(2)} — below threshold, re-retrieval triggered`,
+        score: s.verdict ? "✕" : graded.toFixed(2),
+        scoreN: gradedBar(s),
+        snippet: s.verdict
+          ? (why || "the grader found nothing here that answers the question") +
+            " — re-retrieval triggered"
+          : `graded ${graded.toFixed(2)} — below threshold, re-retrieval triggered`,
         color: A,
         rejected: true,
         chunkId: s.chunk.id,

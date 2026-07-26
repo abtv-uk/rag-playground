@@ -112,6 +112,67 @@ export async function generateLlmAnswer(
   }
 }
 
+// ---------- relevance grading (corrective mode) ----------
+
+/** Much tighter than TIMEOUT_MS: grading sits *in front of* generation on
+ *  the serial path, so every millisecond it spends is taken from the
+ *  answer's own deadline. Measured at ~1.2-1.7s against the real Worker
+ *  (five passages graded in parallel), so 4s leaves headroom for a slow
+ *  draw while still giving up long before the user would notice a stall. */
+const GRADE_TIMEOUT_MS = 4000;
+
+export interface GradeRequest {
+  query: string;
+  doc: "sample" | "upload";
+  chunks: number[] | LlmChunk[];
+}
+
+export interface GradeVerdictWire {
+  i: number;
+  relevant: boolean;
+  why: string;
+}
+
+/** Real model relevance verdicts for corrective mode. Returns null — never
+ *  throws — on any failure (Worker down, quota exhausted, grader confused,
+ *  timeout, abort), which is the whole graceful-degradation seam: the
+ *  caller then keeps the cosine-floor heuristic it would have used before
+ *  this route existed. */
+export async function gradePassages(
+  req: GradeRequest,
+  signal: AbortSignal,
+): Promise<GradeVerdictWire[] | null> {
+  if (!req.chunks.length) return null;
+
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => ac.abort(), GRADE_TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT + "/grade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+      signal: ac.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data?.verdicts)) return null;
+    return data.verdicts.filter(
+      (v: unknown): v is GradeVerdictWire =>
+        !!v &&
+        typeof v === "object" &&
+        Number.isInteger((v as GradeVerdictWire).i) &&
+        typeof (v as GradeVerdictWire).relevant === "boolean",
+    );
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export interface HealthStatus {
   ok: boolean;
   workersAiAvailable: boolean;

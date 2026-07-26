@@ -22,15 +22,18 @@ import {
   type LoadedDoc,
 } from "@/lib/document";
 import { embedQuery, embedTexts } from "@/lib/embeddings";
-import { checkHealth, generateLlmAnswer } from "@/lib/llm";
+import { checkHealth, generateLlmAnswer, gradePassages } from "@/lib/llm";
 import { PipelineRenderer } from "@/lib/renderer";
 import {
+  applyGradeVerdicts,
   buildRealSources,
+  correctivePass1,
   generateSuggestions,
   retrieveAgentic,
   retrieveBasic,
   retrieveCorrective,
   retrieveHybrid,
+  type CorrectivePass1,
 } from "@/lib/retrieval";
 import { applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
 import { steps } from "@/lib/steps";
@@ -280,6 +283,7 @@ export function usePlayground() {
       rag: RagId,
       qsteps: ReturnType<typeof steps>,
       queryVec: Float32Array | null,
+      pass1?: CorrectivePass1,
     ) => {
       const scene = renderer.view.scene;
       const denseOpts = doc.dense && queryVec ? { dense: doc.dense, queryVec } : undefined;
@@ -292,7 +296,9 @@ export function usePlayground() {
               denseOpts,
             )
           : rag === "corrective"
-            ? retrieveCorrective(doc.chunks, q, denseOpts)
+            ? // pass1 carries any model verdicts already applied; absent, this
+              // recomputes pass 1 itself and falls back to the cosine floor
+              retrieveCorrective(doc.chunks, q, denseOpts, pass1)
             : rag === "agentic"
               ? retrieveAgentic(doc.chunks, q, denseOpts)
               : retrieveBasic(doc.chunks, q, denseOpts);
@@ -433,9 +439,46 @@ export function usePlayground() {
         : Promise.resolve(null);
       if (doc.dense) set({ genPhase: "embedding" });
 
-      embedded.then((queryVec) => {
+      embedded.then(async (queryVec) => {
         if (seq !== querySeqRef.current) return;
-        runRetrieval(seq, q, doc, rag, qsteps, queryVec);
+
+        // Corrective's grading step: a real model verdict per candidate,
+        // replacing the cosine-floor heuristic. Runs here rather than
+        // inside retrieval for the same reason query embedding does —
+        // retrieval stays synchronous and pure, and this is the one place
+        // that can await. Everything about it degrades: if the grader is
+        // unreachable, quota-exhausted or slow, `verdicts` is null and
+        // retrieveCorrective falls back to exactly the Phase 2 behavior.
+        let pass1: CorrectivePass1 | undefined;
+        if (rag === "corrective") {
+          const denseOpts =
+            doc.dense && queryVec ? { dense: doc.dense, queryVec } : undefined;
+          pass1 = correctivePass1(doc.chunks, q, denseOpts);
+          const ac = new AbortController();
+          abortRef.current = ac;
+          set({ genPhase: "grading" });
+          const isSample = !!doc.isSample;
+          const verdicts = await gradePassages(
+            {
+              query: q,
+              doc: isSample ? "sample" : "upload",
+              // Same id-vs-text split as generation, for the same reason —
+              // see the comment at the generateLlmAnswer call below.
+              chunks: isSample
+                ? pass1.graded.map((s) => s.chunk.id)
+                : pass1.graded.map((s) => ({
+                    id: s.chunk.id,
+                    page: s.chunk.page,
+                    text: s.chunk.text,
+                  })),
+            },
+            ac.signal,
+          );
+          if (seq !== querySeqRef.current) return;
+          if (verdicts) applyGradeVerdicts(pass1, verdicts);
+        }
+
+        runRetrieval(seq, q, doc, rag, qsteps, queryVec, pass1);
       });
     },
     [clearTimers, renderer, set, runRetrieval],

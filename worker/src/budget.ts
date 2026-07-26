@@ -34,6 +34,31 @@ export const WORKERS_AI_MODELS: Record<Exclude<WorkersAiTier, "exhausted">, stri
 // daily ladder generation draws on — both spend the same Workers AI budget.
 export const BGE_NEURONS_PER_TOKEN = 6.09 / 1000;
 
+// Auxiliary reasoning (relevance grading, and later query planning).
+//
+// This was meant to be the 1B model, to keep a 2-call mode near 1.2x the
+// cost of a 1-call one. It cannot be. Measured on real sample passages, 1B
+// marked EVERY passage relevant in both directions — including three
+// Napster passages judged relevant to "how does weather affect crop
+// yields", justified as "describes the relationship between weather and
+// crop yields" — and for most passages it echoed the format example from
+// the prompt verbatim instead of reasoning. Passing everything is the
+// precise failure this grader exists to prevent (it is what made a
+// relevance-only threshold useless in Phase 2), so a cheaper aux model
+// here would be worse than shipping no grader at all.
+//
+// Real cost on 8B: ~11 neurons to grade five passages against ~13 for a
+// generation call, so corrective is ~1.85x a single-call mode rather than
+// 1.2x. That still allows ~330 corrective queries/day against the 8,000
+// ladder — and for the bundled sample the generation half goes to Gemini,
+// so grading is corrective's only draw on this budget.
+//
+// Deliberately NOT tier-dependent: downshifting this to 1B under load
+// would silently turn grading back into "everything passes". When the
+// ladder is exhausted the route refuses instead, and the client falls back
+// to its own cosine floor.
+export const AUX_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+
 export const GEMINI_MODELS: Record<Exclude<GeminiTier, "exhausted">, string> = {
   flash: "gemini-3.5-flash",
   "flash-lite": "gemini-3.5-flash-lite",

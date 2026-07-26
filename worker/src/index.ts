@@ -5,6 +5,7 @@
 // Routes:
 //   GET  /health    quota/model status, so the client can know before
 //                   asking a question rather than discovering it 6s in
+//   POST /embed     int8-quantized 768-d embeddings for uploaded chunks
 //   POST /generate  SSE token stream, grounded + cited prose
 //
 // Provider routing (the sample/upload trust boundary): the client can only
@@ -12,17 +13,20 @@
 // request carrying inline chunk text is routed to Workers AI regardless of
 // what it claims. See sample.ts for why that boundary exists.
 import {
+  BGE_NEURONS_PER_TOKEN,
   GEMINI_MODELS,
   WORKERS_AI_MODELS,
   checkAndIncrementIpDaily,
   geminiTier,
   hashIp,
   recordGeminiCall,
+  recordWorkersAiSpend,
   workersAiTier,
 } from "./budget";
 import type { Env } from "./env";
 import { buildAnswerPrompt, type RagId } from "./prompts";
 import { connectGemini, streamWorkersAi } from "./providers";
+import { encodeVectorBin, quantizeInt8 } from "./quantize";
 import { resolveSampleChunk } from "./sample";
 import { sseHeaders } from "./sse";
 
@@ -31,6 +35,11 @@ const MAX_QUERY_CHARS = 400;
 const MAX_CHUNKS = 8;
 const MAX_CHUNK_CHARS = 1200;
 const MAX_BODY_BYTES = 32 * 1024;
+
+const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
+const MAX_EMBED_TEXTS = 450;
+const MAX_EMBED_TEXT_CHARS = 2000;
+const MAX_EMBED_BODY_BYTES = 512 * 1024;
 
 interface GenerateRequestBody {
   rag?: unknown;
@@ -168,6 +177,74 @@ async function handleGenerate(
   return new Response(streamWorkersAi(env, ctx, wTier, prompt), { headers: sseHeaders(origin) });
 }
 
+interface EmbedRequestBody {
+  texts?: unknown;
+}
+
+/** Embeds uploaded-document chunks for semantic retrieval. Shares the same
+ *  daily budget ladder as generation (both draw on the Workers AI account),
+ *  checked up front so a document never half-embeds. Response is the same
+ *  binary vectors.bin format the sample's precomputed file uses (see
+ *  quantize.ts) — one decoder on the client handles both. */
+async function handleEmbed(
+  req: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  origin: string | null,
+): Promise<Response> {
+  const raw = await req.text();
+  if (raw.length > MAX_EMBED_BODY_BYTES)
+    return json(413, { error: "request too large" }, origin);
+
+  let body: EmbedRequestBody;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(400, { error: "invalid JSON" }, origin);
+  }
+  if (!Array.isArray(body.texts) || !body.texts.length || !body.texts.every((t) => typeof t === "string")) {
+    return json(400, { error: "texts (string[]) is required" }, origin);
+  }
+  const texts = (body.texts as string[])
+    .slice(0, MAX_EMBED_TEXTS)
+    .map((t) => t.slice(0, MAX_EMBED_TEXT_CHARS));
+
+  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  const { success } = await env.GENERATE_LIMITER.limit({ key: ip });
+  if (!success) return json(429, { error: "rate limited" }, origin);
+
+  const wTier = await workersAiTier(env.QUOTA);
+  if (wTier === "exhausted") return json(503, { error: "quota exhausted" }, origin);
+
+  let result: { data: number[][]; usage?: { prompt_tokens?: number } };
+  try {
+    result = (await env.AI.run(EMBED_MODEL, { text: texts })) as unknown as typeof result;
+  } catch (err) {
+    return json(502, { error: err instanceof Error ? err.message : "embedding failed" }, origin);
+  }
+  const vectors = result.data;
+  if (!Array.isArray(vectors) || !vectors.length)
+    return json(502, { error: "empty embedding response" }, origin);
+  const dim = vectors[0].length;
+
+  const promptTokens = result.usage?.prompt_tokens ?? texts.length * 60; // rough fallback estimate
+  const neurons = promptTokens * BGE_NEURONS_PER_TOKEN;
+  // Unlike /generate's streamed accounting, this response isn't a stream —
+  // it's returned synchronously below, so the write completes as part of
+  // normal request handling and doesn't strictly need waitUntil. Using it
+  // anyway costs nothing and removes any doubt.
+  ctx.waitUntil(recordWorkersAiSpend(env.QUOTA, neurons));
+
+  const batch = quantizeInt8(vectors, dim);
+  const bytes = encodeVectorBin(batch);
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": "application/octet-stream",
+      ...(origin ? { "Access-Control-Allow-Origin": origin, Vary: "Origin" } : {}),
+    },
+  });
+}
+
 async function handleHealth(env: Env, origin: string | null): Promise<Response> {
   const [wTier, gTier] = await Promise.all([workersAiTier(env.QUOTA), geminiTier(env.QUOTA)]);
   return json(
@@ -210,6 +287,9 @@ export default {
 
     if (req.method === "GET" && url.pathname === "/health") {
       return handleHealth(env, origin);
+    }
+    if (req.method === "POST" && url.pathname === "/embed") {
+      return handleEmbed(req, env, ctx, origin);
     }
     if (req.method === "POST" && url.pathname === "/generate") {
       return handleGenerate(req, env, ctx, origin);

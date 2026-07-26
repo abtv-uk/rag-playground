@@ -21,6 +21,7 @@ import {
   parseFile,
   type LoadedDoc,
 } from "@/lib/document";
+import { embedQuery, embedTexts } from "@/lib/embeddings";
 import { checkHealth, generateLlmAnswer } from "@/lib/llm";
 import { PipelineRenderer } from "@/lib/renderer";
 import {
@@ -54,7 +55,14 @@ const INITIAL: PlaygroundState = {
   degraded: false,
   genPhase: "idle",
   generatorOffline: false,
+  embedProgress: null,
 };
+
+// Bounds a single query's embedding call so a slow/hung Worker degrades
+// that one query to lexical-only rather than stalling the whole
+// interaction — much shorter than embedTexts' own per-document timeout,
+// since a query is one short string, not a whole document.
+const QUERY_EMBED_TIMEOUT_MS = 3000;
 
 // How long to wait for generated prose before giving up and showing the
 // offline extractive answer instead. Workers AI's time-to-first-token is
@@ -190,6 +198,31 @@ export function usePlayground() {
         suggestions: generated.length ? generated : SUGGESTIONS,
       });
       runIndex();
+
+      // The sample ships pre-embedded (loadSampleDoc); an upload needs it
+      // computed once, here, overlapping with the indexing animation
+      // rather than adding to the wait — embedding ~400 chunks takes ~1s
+      // in practice, well under INDEX_MS. `doc` is mutated in place once
+      // it resolves (mirroring the existing renderer.view mutation
+      // pattern), since `stateRef.current.doc` is this same object and the
+      // next query reads it directly, no further `set()` required for
+      // correctness. Any failure (quota exhausted, Worker down, network)
+      // just leaves `doc.dense` unset — every retrieval mode already
+      // degrades to lexical-only when that's the case.
+      if (!doc.dense) {
+        const loadSeq = loadSeqRef.current;
+        set({ embedProgress: { done: 0, total: doc.chunks.length } });
+        embedTexts(
+          doc.chunks.map((c) => c.text),
+          (done, total) => {
+            if (loadSeq === loadSeqRef.current) set({ embedProgress: { done, total } });
+          },
+        ).then((dense) => {
+          if (loadSeq !== loadSeqRef.current) return; // superseded by a newer load
+          set({ embedProgress: null });
+          if (dense) doc.dense = dense;
+        });
+      }
     },
     [renderer, runIndex, set],
   );
@@ -235,29 +268,34 @@ export function usePlayground() {
     [after, set],
   );
 
-  const runQuery = useCallback(
-    (q: string) => {
-      clearTimers();
-      const seq = ++querySeqRef.current;
-      lastQueryRef.current = q;
-      const { rag, doc } = stateRef.current;
-      const qsteps = steps(rag);
-      renderer.view.querySteps = qsteps;
-      renderer.view.queryStart = performance.now();
-
-      if (!doc) return;
+  // Split from runQuery below so runQuery's dependency array can reference
+  // this by name — the two together are one logical operation, separated
+  // only because query embedding (runQuery's job) is the one async step in
+  // an otherwise synchronous pipeline.
+  const runRetrieval = useCallback(
+    (
+      seq: number,
+      q: string,
+      doc: LoadedDoc,
+      rag: RagId,
+      qsteps: ReturnType<typeof steps>,
+      queryVec: Float32Array | null,
+    ) => {
       const scene = renderer.view.scene;
+      const denseOpts = doc.dense && queryVec ? { dense: doc.dense, queryVec } : undefined;
       const res =
         rag === "hybrid"
-          ? retrieveHybrid(doc.chunks, q, {
-              nodes: scene.gnodes,
-              neighbors: scene.gnbr,
-            })
+          ? retrieveHybrid(
+              doc.chunks,
+              q,
+              { nodes: scene.gnodes, neighbors: scene.gnbr },
+              denseOpts,
+            )
           : rag === "corrective"
-            ? retrieveCorrective(doc.chunks, q)
+            ? retrieveCorrective(doc.chunks, q, denseOpts)
             : rag === "agentic"
-              ? retrieveAgentic(doc.chunks, q)
-              : retrieveBasic(doc.chunks, q);
+              ? retrieveAgentic(doc.chunks, q, denseOpts)
+              : retrieveBasic(doc.chunks, q, denseOpts);
       applyQueryToScene(scene, res);
       const sources = buildRealSources(rag, res, scene);
 
@@ -363,7 +401,44 @@ export function usePlayground() {
         },
       );
     },
-    [after, clearTimers, renderer, set, streamExtractive],
+    [after, renderer, set, streamExtractive],
+  );
+
+  const runQuery = useCallback(
+    (q: string) => {
+      clearTimers();
+      const seq = ++querySeqRef.current;
+      lastQueryRef.current = q;
+      const { rag, doc } = stateRef.current;
+      const qsteps = steps(rag);
+      renderer.view.querySteps = qsteps;
+      renderer.view.queryStart = performance.now();
+
+      if (!doc) return;
+
+      // Query embedding is a network call, so it's the one part of
+      // retrieval that isn't synchronous. It's fast (a few hundred ms for
+      // one short string) against a 3.1-5s animation, so no holdStep is
+      // needed here the way generation needs one — the visual pipeline
+      // just keeps playing underneath while this resolves. Bounded by
+      // QUERY_EMBED_TIMEOUT_MS so a slow Worker degrades this one query to
+      // lexical-only rather than stalling the interaction.
+      const embedded = doc.dense
+        ? Promise.race([
+            embedQuery(q),
+            new Promise<null>((resolve) =>
+              setTimeout(() => resolve(null), QUERY_EMBED_TIMEOUT_MS),
+            ),
+          ])
+        : Promise.resolve(null);
+      if (doc.dense) set({ genPhase: "embedding" });
+
+      embedded.then((queryVec) => {
+        if (seq !== querySeqRef.current) return;
+        runRetrieval(seq, q, doc, rag, qsteps, queryVec);
+      });
+    },
+    [clearTimers, renderer, set, runRetrieval],
   );
 
   const actions: PlaygroundActions = {
@@ -391,6 +466,7 @@ export function usePlayground() {
         suggestions: SUGGESTIONS,
         degraded: false,
         genPhase: "idle",
+        embedProgress: null,
         phase: "empty",
       });
     },

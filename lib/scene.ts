@@ -19,6 +19,7 @@ import type { LoadedDoc } from "./document";
 import {
   PASS_THRESHOLD,
   extractEntityGraph,
+  passScore,
   type RetrievalResult,
 } from "./retrieval";
 
@@ -137,11 +138,15 @@ export function applyQueryToScene(scene: SceneData, res: RetrievalResult) {
   }
 
   // grading rows: only chunks that were actually scored in pass 1; pad the
-  // panel with unscored rows drawn in the idle style
+  // panel with unscored rows drawn in the idle style. Thresholded (and
+  // displayed) via passScore(), not raw `.score` — under dense retrieval
+  // `.score` is still TF-IDF-shaped normalization of an RRF/cosine value,
+  // not the background-normalized relevance PASS_THRESHOLD is calibrated
+  // against. See passScore()'s docstring in retrieval.ts.
   const rows: GradeRow[] = res.initialTop.slice(0, 5).map((s) => ({
     n: s.chunk.id,
-    pass: (s.score >= PASS_THRESHOLD ? 1 : 0) as 0 | 1,
-    s: Math.max(0.05, s.score),
+    pass: (passScore(s) >= PASS_THRESHOLD ? 1 : 0) as 0 | 1,
+    s: Math.max(0.05, passScore(s)),
     graded: true,
   }));
   for (const c of scene.dots) {

@@ -30,6 +30,13 @@ export interface GenerateRequest {
   /** Bare chunk ids for the sample (the Worker resolves them against its
    *  own bundled copy); full {id,page,text} objects for anything else. */
   chunks: number[] | LlmChunk[];
+  /** Hybrid only: entity labels the knowledge graph linked to this query,
+   *  so the answer can make those relationships explicit instead of reading
+   *  like naive's. Ignored by the Worker for other modes, and filtered
+   *  there to labels that actually occur in the resolved passages — see
+   *  resolveConcepts in worker/src/index.ts for why that filter is a trust
+   *  boundary, not just tidiness. */
+  concepts?: string[];
 }
 
 type WireEvent =

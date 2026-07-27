@@ -33,18 +33,33 @@ export interface BuiltPrompt {
   user: string;
 }
 
+// Hybrid's extra instruction. The graph half of hybrid retrieval already
+// influences WHICH chunks are retrieved; without this the answer reads
+// identically to naive's, because nothing asks the model to use the
+// relationship the graph found. Appended only when concepts survive
+// filtering — an empty RELATED CONCEPTS line would be worse than none.
+const CONCEPT_RULE =
+  '7. The RELATED CONCEPTS below are entities the knowledge graph linked to this question. Where the passages support it, make the relationship between them explicit rather than describing each separately. Never mention the concept list, the graph, or that you were given these terms.';
+
 export function buildAnswerPrompt(
   rag: RagId,
   query: string,
   passages: PassageForPrompt[],
+  concepts: string[] = [],
 ): BuiltPrompt {
   const frame = MODE_FRAME[rag] ?? MODE_FRAME.naive;
   const context = passages
     .map((p, i) => `[${i + 1}] (p.${p.page}) ${p.text}`)
     .join("\n\n");
+  const useConcepts = rag === "hybrid" && concepts.length > 0;
   return {
-    system: `You answer questions strictly from the numbered passages provided, produced by ${frame}.\n${SYSTEM_RULES}`,
-    user: `PASSAGES\n${context}\n\nQUESTION: ${query}`,
+    system:
+      `You answer questions strictly from the numbered passages provided, produced by ${frame}.\n${SYSTEM_RULES}` +
+      (useConcepts ? `\n${CONCEPT_RULE}` : ""),
+    user:
+      `PASSAGES\n${context}` +
+      (useConcepts ? `\n\nRELATED CONCEPTS: ${concepts.join(", ")}` : "") +
+      `\n\nQUESTION: ${query}`,
   };
 }
 

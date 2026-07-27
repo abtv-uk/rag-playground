@@ -54,6 +54,39 @@ interface GenerateRequestBody {
   query?: unknown;
   doc?: unknown;
   chunks?: unknown;
+  concepts?: unknown;
+}
+
+const MAX_CONCEPTS = 6;
+const MAX_CONCEPT_CHARS = 40;
+
+/** Hybrid's graph-linked entity labels, sanitized for the prompt.
+ *
+ *  Every concept must literally occur in the passages this request already
+ *  resolved. That is a trust-boundary requirement, not just prompt hygiene:
+ *  `concepts` is client-supplied free text, and on the sample path the
+ *  passages themselves are resolved server-side from bare ids precisely so
+ *  that nothing a caller typed reaches Gemini. Without this check the field
+ *  would be an open channel straight past that boundary. Requiring each
+ *  concept to appear in the resolved text closes it, and independently
+ *  makes the prompt better — the model cannot connect a concept the
+ *  passages never mention. */
+function resolveConcepts(body: GenerateRequestBody, passages: Passage[]): string[] {
+  if (!Array.isArray(body.concepts)) return [];
+  const haystack = passages.map((p) => p.text).join("\n").toLowerCase();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of body.concepts) {
+    if (typeof c !== "string") continue;
+    const term = c.trim().slice(0, MAX_CONCEPT_CHARS);
+    const key = term.toLowerCase();
+    if (!term || seen.has(key)) continue;
+    if (!haystack.includes(key)) continue;
+    seen.add(key);
+    out.push(term);
+    if (out.length === MAX_CONCEPTS) break;
+  }
+  return out;
 }
 
 interface Passage {
@@ -157,7 +190,12 @@ async function handleGenerate(
   const { passages, provider } = resolvePassages(body);
   if (!passages.length) return json(400, { error: "no resolvable passages" }, origin);
 
-  const prompt = buildAnswerPrompt(body.rag as RagId, query, passages);
+  const prompt = buildAnswerPrompt(
+    body.rag as RagId,
+    query,
+    passages,
+    resolveConcepts(body, passages),
+  );
 
   if (provider === "gemini") {
     const tier = await geminiTier(env.QUOTA);

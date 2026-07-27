@@ -391,6 +391,26 @@ export function usePlayground() {
                 const c = chunkById.get(s.chunkId)!;
                 return { id: c.id, page: c.page, text: c.text };
               }),
+          // Hybrid: the entities the graph actually linked to this query —
+          // the same ones the trace cards surface — so the prose reflects
+          // the graph half of the retrieval instead of reading like naive's.
+          // Full labels, not the truncated display ones, since the Worker
+          // matches them against passage text.
+          //
+          // Frequently EMPTY on the bundled sample, and that is an
+          // extractEntityGraph problem, not a bug here: its top-11 entities
+          // are dominated by geography and citation boilerplate (United
+          // States, America, Wikimedia Commons, Retrieved), so 3 of the 4
+          // sample TRY questions match no entity at all and this stays [].
+          // The Worker then omits the RELATED CONCEPTS line entirely, which
+          // is the correct degradation — an empty concept list would be
+          // worse than none. Measured; tracked separately.
+          concepts:
+            rag === "hybrid"
+              ? (res.graphBoosted ?? [])
+                  .map((gi) => scene.gnodes[gi]?.full || scene.gnodes[gi]?.label)
+                  .filter((s): s is string => !!s)
+              : undefined,
         },
         (delta) => {
           if (seq !== querySeqRef.current) return;

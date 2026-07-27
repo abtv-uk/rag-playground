@@ -73,35 +73,31 @@ const QUERY_EMBED_TIMEOUT_MS = 3000;
 // bound is slightly looser than the single-query one above.
 const AGENTIC_EMBED_TIMEOUT_MS = 4500;
 
-// Interim quality bar on hybrid's RELATED CONCEPTS, until extractEntityGraph
-// stops ranking citation and geography noise into its top entities.
+// Quality bar on hybrid's RELATED CONCEPTS: send only entities whose OWN
+// label matched a query term, never the 1-hop graph neighbors that
+// graphBoosted also carries.
 //
-// Observed on the deployed site: "What does it say about patent cases?" sent
+// Why: on the deployed site "What does it say about patent cases?" sent
 // ["Patents", "America", "Khan"] and the answer duly reorganized itself
 // around an America-vs-Britain historical contrast instead of patent-case
-// substance. "Khan" is an author surname; it passes the Worker's
-// appears-in-the-passages check honestly, because it really does appear —
-// in a citation. Noise that steers generation is worse than no concepts at
-// all, hence a gate rather than waiting for the root-cause fix.
+// substance. None of that noise was a match — it arrived as neighbors of
+// "Patents". The neighbor hop is right for boosting *retrieval*
+// (co-occurrence points at relevant chunks) and wrong for steering *prose*,
+// which is exactly the distinction graphMatched draws.
 //
-// Two rules, both deliberately conservative:
-//  1. Only entities whose OWN label matched a query term. America and Khan
-//     were never matches — they arrived as 1-hop graph neighbors of
-//     "Patents". That hop is right for boosting retrieval (co-occurrence
-//     points at relevant chunks) and wrong for steering prose, which is
-//     exactly the distinction graphMatched exists to draw. This trades
-//     recall for precision: a genuinely useful neighbor like USPTO is lost
-//     too, which is the correct trade while the inputs are untrustworthy.
-//  2. At least two, because the prompt rule asks the model to make the
-//     relationship BETWEEN concepts explicit — with one there is no
-//     relationship to draw, and the instruction misleads.
+// Improved entity extraction has since removed the worst offenders (Khan,
+// Wikimedia Commons, Retrieved) but NOT the geographic ones: for that same
+// query the neighbor set is still Patent System + America + United States,
+// so this gate still earns its place. Measured against the current
+// extraction, matched-only yields exactly the subject of each question —
+// Intellectual Property, Patent System, Trade Secret.
 //
-// Falls to undefined, which the Worker treats as "omit the line entirely" —
-// today's pre-concepts behavior. On the bundled sample that means hybrid is
-// currently inert again, which is the honest state: better silent than
-// steered by an author's surname. Revisit once entity quality lands.
-const MIN_CONCEPTS = 2;
-
+// Deliberately trades recall for precision: a genuinely useful neighbor
+// would be dropped too. Revisit if neighbors ever become trustworthy.
+//
+// Falls to undefined when a query names nothing the graph knows, which the
+// Worker treats as "omit the RELATED CONCEPTS line entirely" — an empty
+// list would be worse than none.
 function conceptsForPrompt(
   res: { graphMatched?: number[] },
   scene: { gnodes: { full?: string; label: string }[] },
@@ -109,7 +105,7 @@ function conceptsForPrompt(
   const labels = (res.graphMatched ?? [])
     .map((gi) => scene.gnodes[gi]?.full || scene.gnodes[gi]?.label)
     .filter((s): s is string => !!s);
-  return labels.length >= MIN_CONCEPTS ? labels.slice(0, 6) : undefined;
+  return labels.length ? labels.slice(0, 6) : undefined;
 }
 
 // How long to wait for generated prose before giving up and showing the

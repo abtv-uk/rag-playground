@@ -129,6 +129,12 @@ export interface RetrievalResult {
   planSubqueries?: string[]; // agentic (planned): the sub-queries retrieved
   planRationale?: string; // agentic (planned): model's own decomposition note
   graphBoosted?: number[]; // hybrid: entity indices that boosted retrieval
+  /** hybrid: the subset of graphBoosted whose own label matched a query
+   *  term, excluding the 1-hop neighbors graphBoosted also carries. Kept
+   *  separate because the neighbor hop is right for *boosting retrieval*
+   *  (co-occurring entities point at relevant chunks) but wrong for
+   *  *steering generation* — see the concept gate in hooks/usePlayground.ts. */
+  graphMatched?: number[];
   boostedChunkIds?: Set<number>; // hybrid: chunks whose rank the graph raised
 }
 
@@ -402,6 +408,7 @@ export function retrieveHybrid(
   return {
     ...finish(finalRanked, qTerms, { initialTop, finalTop }),
     graphBoosted: [...active].slice(0, 6),
+    graphMatched: [...matched],
     boostedChunkIds: boostChunkIds,
   };
 }

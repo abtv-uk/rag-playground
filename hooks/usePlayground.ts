@@ -73,6 +73,45 @@ const QUERY_EMBED_TIMEOUT_MS = 3000;
 // bound is slightly looser than the single-query one above.
 const AGENTIC_EMBED_TIMEOUT_MS = 4500;
 
+// Interim quality bar on hybrid's RELATED CONCEPTS, until extractEntityGraph
+// stops ranking citation and geography noise into its top entities.
+//
+// Observed on the deployed site: "What does it say about patent cases?" sent
+// ["Patents", "America", "Khan"] and the answer duly reorganized itself
+// around an America-vs-Britain historical contrast instead of patent-case
+// substance. "Khan" is an author surname; it passes the Worker's
+// appears-in-the-passages check honestly, because it really does appear —
+// in a citation. Noise that steers generation is worse than no concepts at
+// all, hence a gate rather than waiting for the root-cause fix.
+//
+// Two rules, both deliberately conservative:
+//  1. Only entities whose OWN label matched a query term. America and Khan
+//     were never matches — they arrived as 1-hop graph neighbors of
+//     "Patents". That hop is right for boosting retrieval (co-occurrence
+//     points at relevant chunks) and wrong for steering prose, which is
+//     exactly the distinction graphMatched exists to draw. This trades
+//     recall for precision: a genuinely useful neighbor like USPTO is lost
+//     too, which is the correct trade while the inputs are untrustworthy.
+//  2. At least two, because the prompt rule asks the model to make the
+//     relationship BETWEEN concepts explicit — with one there is no
+//     relationship to draw, and the instruction misleads.
+//
+// Falls to undefined, which the Worker treats as "omit the line entirely" —
+// today's pre-concepts behavior. On the bundled sample that means hybrid is
+// currently inert again, which is the honest state: better silent than
+// steered by an author's surname. Revisit once entity quality lands.
+const MIN_CONCEPTS = 2;
+
+function conceptsForPrompt(
+  res: { graphMatched?: number[] },
+  scene: { gnodes: { full?: string; label: string }[] },
+): string[] | undefined {
+  const labels = (res.graphMatched ?? [])
+    .map((gi) => scene.gnodes[gi]?.full || scene.gnodes[gi]?.label)
+    .filter((s): s is string => !!s);
+  return labels.length >= MIN_CONCEPTS ? labels.slice(0, 6) : undefined;
+}
+
 // How long to wait for generated prose before giving up and showing the
 // offline extractive answer instead. Workers AI's time-to-first-token is
 // well under a second; Gemini (used for the sample) is both the slower
@@ -391,25 +430,11 @@ export function usePlayground() {
                 const c = chunkById.get(s.chunkId)!;
                 return { id: c.id, page: c.page, text: c.text };
               }),
-          // Hybrid: the entities the graph actually linked to this query —
-          // the same ones the trace cards surface — so the prose reflects
-          // the graph half of the retrieval instead of reading like naive's.
-          // Full labels, not the truncated display ones, since the Worker
-          // matches them against passage text.
-          //
-          // Still legitimately empty when a query names nothing the graph
-          // knows, and the Worker then omits the RELATED CONCEPTS line
-          // entirely — the correct degradation, since an empty concept list
-          // would be worse than none. It is no longer the normal case on the
-          // bundled sample: every one of its TRY questions now matches
-          // (extractEntityGraph used to return only proper nouns, so three
-          // of them matched nothing at all).
-          concepts:
-            rag === "hybrid"
-              ? (res.graphBoosted ?? [])
-                  .map((gi) => scene.gnodes[gi]?.full || scene.gnodes[gi]?.label)
-                  .filter((s): s is string => !!s)
-              : undefined,
+          // Hybrid: entities the graph linked to this query, so the prose
+          // reflects the graph half of the retrieval instead of reading
+          // like naive's. Full labels, not the truncated display ones,
+          // since the Worker matches them against passage text.
+          concepts: rag === "hybrid" ? conceptsForPrompt(res, scene) : undefined,
         },
         (delta) => {
           if (seq !== querySeqRef.current) return;

@@ -125,7 +125,9 @@ export interface RetrievalResult {
   finalTop: ScoredChunk[]; // what the answer is actually built from
   rejected?: ScoredChunk[]; // corrective: graded-out chunks
   replacements?: ScoredChunk[]; // corrective: chunks found by re-retrieval
-  refinedTerms?: string[]; // agentic: terms actually added in pass 2
+  refinedTerms?: string[]; // agentic (PRF fallback): terms actually added in pass 2
+  planSubqueries?: string[]; // agentic (planned): the sub-queries retrieved
+  planRationale?: string; // agentic (planned): model's own decomposition note
   graphBoosted?: number[]; // hybrid: entity indices that boosted retrieval
   boostedChunkIds?: Set<number>; // hybrid: chunks whose rank the graph raised
 }
@@ -490,10 +492,26 @@ export function retrieveCorrective(
   });
 }
 
+/** A validated /plan decomposition, handed in by the hook (the one place
+ *  that can await — same seam as corrective's pass1/verdicts split).
+ *  `subVecs` is parallel to `subqueries`; entries may be missing when the
+ *  batched embed failed or the doc has no dense index, in which case that
+ *  sub-query retrieves lexically only. */
+export interface AgenticPlanOpts {
+  subqueries: string[];
+  subVecs?: (Float32Array | null)[];
+  rationale: string;
+}
+
+// Per-sub-query ranked lists are capped before RRF so one broad sub-query
+// (many weak lexical matches) can't out-vote the others by sheer length.
+const SUBQUERY_LIST_CAP = 20;
+
 export function retrieveAgentic(
   chunks: DocChunk[],
   query: string,
   opts?: DenseOpts,
+  plan?: AgenticPlanOpts,
 ): RetrievalResult {
   const qTerms = [...new Set(tokenize(query))];
   const lexical = normalize(scoreChunks(chunks, qTerms));
@@ -503,6 +521,57 @@ export function retrieveAgentic(
       : lexical;
 
   const initialTop = pass1.slice(0, 6).map((s) => ({ ...s }));
+
+  // Planned path: pass 2 retrieves per sub-query and RRF-merges everything.
+  // Measured against the bundled sample this genuinely changes the result
+  // set (Jaccard 0.09-0.71 vs basic dense top-6 across probe queries, new
+  // chunks surfaced for every compound question) — it is not a cosmetic
+  // relabel of the PRF loop.
+  if (plan?.subqueries.length) {
+    const lists: { id: number }[][] = [];
+    plan.subqueries.forEach((sub, i) => {
+      const subLex = scoreChunks(chunks, [...new Set(tokenize(sub))]).slice(0, SUBQUERY_LIST_CAP);
+      if (subLex.length) lists.push(subLex.map((s) => ({ id: s.chunk.id })));
+      const vec = plan.subVecs?.[i];
+      if (opts?.dense && vec) {
+        lists.push(
+          cosineRank(opts.dense, vec)
+            .slice(0, SUBQUERY_LIST_CAP)
+            .map((r) => {
+              const chunk = chunks[r.i];
+              return { id: chunk ? chunk.id : -1 };
+            })
+            .filter((e) => e.id !== -1),
+        );
+      }
+    });
+    // Original-query ranking participates as one list among the sub-query
+    // lists, so the merged set stays anchored to the actual question while
+    // each sub-query pulls in its own aspect.
+    const fused = rrf([pass1.map((s) => ({ id: s.chunk.id })), ...lists]);
+    const byIdPass1 = new Map(pass1.map((s) => [s.chunk.id, s]));
+    const byIdChunk = new Map(chunks.map((c) => [c.id, c]));
+    const merged = [...fused.entries()]
+      .map(([id, raw]): ScoredChunk | null => {
+        const chunk = byIdChunk.get(id);
+        if (!chunk) return null;
+        const prev = byIdPass1.get(id);
+        return { chunk, raw, score: 0, relevance: prev?.relevance, cosine: prev?.cosine };
+      })
+      .filter((s): s is ScoredChunk => !!s)
+      .sort((a, b) => b.raw - a.raw);
+    const finalTop = normalize(merged).slice(0, 6);
+    return finish(merged, qTerms, {
+      initialTop,
+      finalTop,
+      refinedTerms: [],
+      planSubqueries: plan.subqueries,
+      planRationale: plan.rationale,
+    });
+  }
+
+  // PRF fallback — the pre-/plan behavior, still what runs whenever the
+  // planner is unreachable, quota-exhausted, or returned a degenerate plan.
   const refinedTerms = prfTerms(pass1.slice(0, 2), qTerms, 3, chunks);
   if (!refinedTerms.length) {
     return finish(pass1, qTerms, {
@@ -783,15 +852,24 @@ export function buildRealSources(
   if (rag === "agentic") {
     const cards: Source[] = [chunkCard(top[0])];
     const refined = res.refinedTerms ?? [];
+    const planned = res.planSubqueries ?? [];
     cards.push({
       kind: "tool",
-      label: "refine query",
+      label: planned.length ? "plan queries" : "refine query",
       meta: "agent step",
-      score: refined.length ? "+" : "·",
-      scoreN: refined.length ? 0.8 : 0.3,
-      snippet: refined.length
-        ? 'added "' + refined.join(" ") + '" and re-retrieved'
-        : "first pass sufficient — no refinement needed",
+      score: planned.length || refined.length ? "+" : "·",
+      scoreN: planned.length || refined.length ? 0.8 : 0.3,
+      // Planned path: the model's own decomposition, verbatim — the same
+      // show-the-real-reasoning move as corrective's verdict cards. PRF
+      // fallback keeps the pre-/plan wording.
+      snippet: planned.length
+        ? 'split into "' +
+          planned.join('" · "') +
+          '"' +
+          (res.planRationale ? " — " + res.planRationale : "")
+        : refined.length
+          ? 'added "' + refined.join(" ") + '" and re-retrieved'
+          : "first pass sufficient — no refinement needed",
       color: A,
     });
     // prefer showing a chunk the refinement surfaced (absent from pass 1)

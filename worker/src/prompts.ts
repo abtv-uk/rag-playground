@@ -95,6 +95,31 @@ Use exactly this shape:
 {"relevant":true,"why":"defines the term and gives an example"}
 "why" is required and must never be empty, including when relevant is false — say what the passage does contain, e.g. {"relevant":false,"why":"a list of chapter learning objectives"}`;
 
+// ---------- query planning (agentic mode's decomposition) ----------
+
+// Same output-contract-in-the-prompt approach as grading, for the same
+// measured reasons (no json_schema support; json_object unenforced on some
+// models). `rationale` is user-visible on the refine-query trace card, so —
+// like grading's `why`, which came back empty until stated mandatory with a
+// negative-case example — it is required explicitly from the start.
+const PLAN_RULES = [
+  "Split the question into 2 or 3 self-contained search queries that together cover it. Each must target a DIFFERENT aspect — never rephrasings of each other or of the original.",
+  "Each subquery is 3-8 words of search terms, not a sentence addressed to anyone.",
+  "If the question is simple enough that splitting adds nothing, return a single subquery identical to the original question.",
+  '"rationale" is required and must never be empty: one clause, at most 12 words, lower case, no trailing period, describing the decomposition itself (e.g. "split into definition and legal-protection aspects"). It is shown to the user verbatim.',
+].join("\n");
+
+const PLAN_FORMAT = `Reply with JSON and nothing else. No prose, no explanation, no markdown code fences.
+Use exactly this shape:
+{"subqueries":["trade secret definition","trade secret legal protection requirements"],"rationale":"split into definition and legal-protection aspects"}`;
+
+export function buildPlanPrompt(query: string): BuiltPrompt {
+  return {
+    system: `You decompose a question into search queries for retrieving passages from one document.\n${PLAN_RULES}\n\n${PLAN_FORMAT}`,
+    user: `QUESTION: ${query}\n\nDecompose it. JSON only.`,
+  };
+}
+
 /** Grades a SINGLE passage for relevance to the query — see the note above
  *  for why this is not batched. Much smaller than buildAnswerPrompt: this
  *  runs on the aux model and asks for a classification, not prose. */

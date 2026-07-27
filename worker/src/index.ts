@@ -7,6 +7,7 @@
 //                   asking a question rather than discovering it 6s in
 //   POST /embed     int8-quantized 768-d embeddings for uploaded chunks
 //   POST /grade     JSON relevance verdicts for corrective mode
+//   POST /plan      JSON sub-query decomposition for agentic mode
 //   POST /generate  SSE token stream, grounded + cited prose
 //
 // Provider routing (the sample/upload trust boundary): the client can only
@@ -28,6 +29,7 @@ import type { Env } from "./env";
 import {
   buildAnswerPrompt,
   buildGradePrompt,
+  buildPlanPrompt,
   type GradeVerdict,
   type RagId,
 } from "./prompts";
@@ -348,6 +350,65 @@ async function handleGrade(
   return json(200, { verdicts }, origin);
 }
 
+interface PlanRequestBody {
+  query?: unknown;
+}
+
+const MAX_PLAN_SUBQUERIES = 3;
+
+/** Sub-query decomposition for agentic mode. Query text only — no passages
+ *  ever reach this route, so there is no provider question to answer: it
+ *  runs on the aux model like grading, and the trust boundary is untouched.
+ *  Same per-IP accounting stance as /grade: the /generate call that follows
+ *  is what charges the visitor's daily unit. */
+async function handlePlan(
+  req: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  origin: string | null,
+): Promise<Response> {
+  const raw = await req.text();
+  if (raw.length > MAX_BODY_BYTES) return json(413, { error: "request too large" }, origin);
+
+  let body: PlanRequestBody;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(400, { error: "invalid JSON" }, origin);
+  }
+  if (typeof body.query !== "string") {
+    return json(400, { error: "query is required" }, origin);
+  }
+  const query = body.query.slice(0, MAX_QUERY_CHARS).trim();
+  if (!query) return json(400, { error: "empty query" }, origin);
+
+  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  const { success } = await env.GENERATE_LIMITER.limit({ key: ip });
+  if (!success) return json(429, { error: "rate limited" }, origin);
+
+  const wTier = await workersAiTier(env.QUOTA);
+  if (wTier === "exhausted") return json(503, { error: "quota exhausted" }, origin);
+
+  const parsed = await runAuxJson(env, ctx, buildPlanPrompt(query));
+  if (!parsed || typeof parsed !== "object") {
+    return json(502, { error: "planner returned no usable plan" }, origin);
+  }
+  const o = parsed as Record<string, unknown>;
+  // Shape validation only — semantic degeneracy (subqueries that just
+  // restate the original, duplicates) is guarded client-side where the
+  // fallback path lives; see planQuery in lib/llm.ts.
+  const subqueries = (Array.isArray(o.subqueries) ? o.subqueries : [])
+    .filter((s): s is string => typeof s === "string" && !!s.trim())
+    .map((s) => s.trim().slice(0, MAX_QUERY_CHARS))
+    .slice(0, MAX_PLAN_SUBQUERIES);
+  if (!subqueries.length) {
+    return json(502, { error: "planner returned no usable plan" }, origin);
+  }
+  const rationale =
+    typeof o.rationale === "string" ? o.rationale.slice(0, 120).trim() : "";
+  return json(200, { subqueries, rationale }, origin);
+}
+
 async function handleHealth(env: Env, origin: string | null): Promise<Response> {
   const [wTier, gTier] = await Promise.all([workersAiTier(env.QUOTA), geminiTier(env.QUOTA)]);
   return json(
@@ -396,6 +457,9 @@ export default {
     }
     if (req.method === "POST" && url.pathname === "/grade") {
       return handleGrade(req, env, ctx, origin);
+    }
+    if (req.method === "POST" && url.pathname === "/plan") {
+      return handlePlan(req, env, ctx, origin);
     }
     if (req.method === "POST" && url.pathname === "/generate") {
       return handleGenerate(req, env, ctx, origin);

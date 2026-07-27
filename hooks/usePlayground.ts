@@ -397,14 +397,13 @@ export function usePlayground() {
           // Full labels, not the truncated display ones, since the Worker
           // matches them against passage text.
           //
-          // Frequently EMPTY on the bundled sample, and that is an
-          // extractEntityGraph problem, not a bug here: its top-11 entities
-          // are dominated by geography and citation boilerplate (United
-          // States, America, Wikimedia Commons, Retrieved), so 3 of the 4
-          // sample TRY questions match no entity at all and this stays [].
-          // The Worker then omits the RELATED CONCEPTS line entirely, which
-          // is the correct degradation — an empty concept list would be
-          // worse than none. Measured; tracked separately.
+          // Still legitimately empty when a query names nothing the graph
+          // knows, and the Worker then omits the RELATED CONCEPTS line
+          // entirely — the correct degradation, since an empty concept list
+          // would be worse than none. It is no longer the normal case on the
+          // bundled sample: every one of its TRY questions now matches
+          // (extractEntityGraph used to return only proper nouns, so three
+          // of them matched nothing at all).
           concepts:
             rag === "hybrid"
               ? (res.graphBoosted ?? [])

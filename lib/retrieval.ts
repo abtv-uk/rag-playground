@@ -341,6 +341,16 @@ export interface GraphForRetrieval {
   neighbors: Record<number, Set<number>>;
 }
 
+/** Two words are the same term if they differ only by an inflectional
+ *  ending ("patent"/"patents", "file"/"filed"). A bare prefix test is not
+ *  enough here: the query "trade secret" would light up the entity
+ *  "Trademark Office", because "trademark" starts with "trade". */
+function sameWord(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [long, short] = a.length > b.length ? [a, b] : [b, a];
+  return short.length >= 4 && long.length - short.length <= 2 && long.startsWith(short);
+}
+
 export function retrieveHybrid(
   chunks: DocChunk[],
   query: string,
@@ -355,8 +365,7 @@ export function retrieveHybrid(
   const matched = new Set<number>();
   graph.nodes.forEach((n, i) => {
     const terms = tokenize(n.full || n.label);
-    if (terms.some((t) => qTerms.some((q) => t === q || t.startsWith(q))))
-      matched.add(i);
+    if (terms.some((t) => qTerms.some((q) => sameWord(t, q)))) matched.add(i);
   });
   const active = new Set(matched);
   for (const i of matched)
@@ -669,6 +678,17 @@ function extractAnswer(top: ScoredChunk[], qTerms: string[]): string {
 }
 
 // ---------- entity graph ----------
+//
+// The graph has two jobs: it is the constellation the user sees in hybrid
+// mode, and it is what hybrid retrieval matches a query against (and so
+// what feeds the generator's RELATED CONCEPTS line). Both jobs want the
+// document's *subject matter*, which is why the harvest below has two
+// halves. Capitalized runs alone — all this used to do — can only ever
+// yield proper nouns, so on a textbook about intellectual property the
+// entire graph came out as "United States", "America", "Wikimedia
+// Commons": the real concepts are written lowercase mid-sentence and were
+// invisible to it. Recurring content-word phrases supply those, and the
+// two pools are merged under one score.
 
 export interface ExtractedEntity {
   label: string;
@@ -692,7 +712,22 @@ const ENTITY_STOP = new Set(
     // citation / reference artifacts (legal & academic texts)
     "See Rule Fed Ibid Cir Supp Vol Pub Sec Art Reporter Nutshell Eds Trans Rev " +
     "Stat Reg Ann App Ch Pt Ed Cf Id No Press University Journal Review Rev'd " +
-    "Appendix Index Contents").split(/\s+/),
+    "Appendix Index Contents " +
+    // bibliography and image-credit boilerplate — capitalized on every
+    // occurrence ("Retrieved from…", "credit: Wikimedia Commons"), so
+    // frequency alone can never tell it apart from a real name. Only words
+    // that are boilerplate in every genre belong here: "Copyright" and
+    // "Rights" appear in the same credit lines but are subject matter in a
+    // document about intellectual property, and blocking them would be
+    // tuning this list to one book.
+    "Retrieved Accessed Access Wikimedia Commons " +
+    // learning-objective scaffolding, likewise capitalized by convention
+    "Understand Describe Identify Explain Discuss Define Analyze Summarize " +
+    "Outline Compare Evaluate Recognize Learning Objectives Exercises Terms " +
+    "Summary Assessment Questions Glossary References Bibliography " +
+    // the same convention in technical documentation
+    "Example Examples Default Defaults Returns Parameter Parameters Usage " +
+    "Argument Arguments Optional Required Deprecated").split(/\s+/),
 );
 
 /** An entity must be a real name, not a citation abbreviation. Short single
@@ -705,12 +740,85 @@ function isCitationArtifact(term: string): boolean {
   return false;
 }
 
-export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
-  const counts = new Map<string, { count: number; chunkIds: Set<number> }>();
-  const perChunk: string[][] = [];
+interface Candidate {
+  label: string;
+  count: number;
+  chunkIds: Set<number>;
+  /** Variants are merged into one candidate, so `count` stops describing
+   *  `label` alone; this is how often the surviving surface form itself
+   *  appeared, which is what decides whether a variant takes the label
+   *  over. */
+  surfaceCount: number;
+  /** Node identity: variants share it, so the two pools can be deduplicated
+   *  against each other and co-occurrence counted once per entity. */
+  key: string;
+}
+
+/** Singular-ish key so "trade secret"/"trade secrets" and "Patent"/"Patents"
+ *  collapse into one node instead of occupying two of eleven slots. */
+function conceptKey(label: string): string {
+  const singular = (w: string) =>
+    /ies$/.test(w)
+      ? w.slice(0, -3) + "y"
+      : // "business", "status", "basis" are not plurals
+        /(?:ss|us|is)$/.test(w)
+        ? w
+        : w.replace(/s$/, "");
+  return label.toLowerCase().split(" ").map(singular).join(" ");
+}
+
+/** Frequent AND concentrated — the same df²-style shape regionPhrase uses to
+ *  pick a section's subject. Ranking on raw count instead puts whatever the
+ *  document mentions everywhere (a country, a court) above what it is
+ *  actually about. */
+const concentration = (c: Candidate) => (c.count * c.count) / c.chunkIds.size;
+
+/** Recurring content-word phrases: the document's subject matter, which is
+ *  written lowercase and so never appears in the capitalized-run pool.
+ *  Phrases are built only from words adjacent in the source sentence, so
+ *  "Patent and Trademark Office" does not become "patent trademark". */
+function harvestPhrases(chunks: DocChunk[]): Map<string, Candidate> {
+  const out = new Map<string, Candidate>();
   for (const c of chunks) {
-    // capitalized runs not at sentence start: "Knowledge Graph", "Transformer"
-    const found = new Set<string>();
+    // Clause boundaries end a phrase. Two words are only a phrase if they
+    // were written as one: "…the patent. Trade secrets…" is not "patent
+    // trade", a list of "patents, trademarks" is not "patent trademark",
+    // and a URL path is not a phrase at all — that last one is what turns
+    // a markdown document's own link targets into its top "concepts".
+    for (const clause of c.text
+      .toLowerCase()
+      // underscores split identifiers (UND_ERR_SOCKET), and a dash with
+      // space around it is punctuation rather than part of a compound word
+      .split(/[.;:!?,()[\]{}"“”/|<>#*=_`\\]+|\s[-–—]+\s/)) {
+      const words = clause.match(/[a-z0-9][a-z0-9'-]{1,}/g) || [];
+      for (let i = 0; i < words.length - 1; i++) {
+        const [a, b] = [words[i], words[i + 1]];
+        if (a.length < 3 || b.length < 3 || STOP.has(a) || STOP.has(b)) continue;
+        // "docs docs", "string string" — markup, never a concept
+        if (sameWord(a, b)) continue;
+        const label = a + " " + b;
+        if (PHRASE_NOISE.test(label) || /\d/.test(label)) continue;
+        const e = out.get(label) || {
+          label,
+          count: 0,
+          surfaceCount: 0,
+          chunkIds: new Set<number>(),
+          key: conceptKey(label),
+        };
+        e.count++;
+        e.surfaceCount++;
+        e.chunkIds.add(c.id);
+        out.set(label, e);
+      }
+    }
+  }
+  return out;
+}
+
+/** Capitalized runs not at sentence start: "Federal Circuit", "USPTO". */
+function harvestNames(chunks: DocChunk[]): Map<string, Candidate> {
+  const out = new Map<string, Candidate>();
+  for (const c of chunks) {
     const re = /(?<![.!?]\s)(?<!^)\b([A-Z][a-zA-Z0-9-]{2,}(?:\s[A-Z][a-zA-Z0-9-]{2,}){0,2})\b/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(c.text))) {
@@ -718,36 +826,144 @@ export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
       const wordsInTerm = term.split(" ");
       if (wordsInTerm.some((w) => ENTITY_STOP.has(w))) continue;
       if (isCitationArtifact(term)) continue;
-      found.add(term);
-      const e = counts.get(term) || { count: 0, chunkIds: new Set<number>() };
+      const e = out.get(term) || {
+        label: term,
+        count: 0,
+        surfaceCount: 0,
+        chunkIds: new Set<number>(),
+        key: conceptKey(term),
+      };
       e.count++;
+      e.surfaceCount++;
       e.chunkIds.add(c.id);
-      counts.set(term, e);
+      out.set(term, e);
     }
-    perChunk.push([...found]);
   }
-  const topTerms = [...counts.entries()]
-    .filter(([, v]) => v.count >= 2)
-    .sort((a, b) => b[1].count - a[1].count)
-    .slice(0, 11);
+  return out;
+}
+
+/** Merge candidates that mean the same thing, pooling their mentions:
+ *  "Patent"/"Patents" and "America"/"American" become one node each, while
+ *  "Patents"/"patent rights" stay distinct. Without this, one entity spends
+ *  two of eleven slots on two spellings of itself. */
+function mergeVariants(cands: Candidate[]): Candidate[] {
+  const best = new Map<string, Candidate>();
+  const variantOf = (key: string) => {
+    if (best.has(key)) return key;
+    const words = key.split(" ");
+    for (const existing of best.keys()) {
+      const other = existing.split(" ");
+      if (other.length !== words.length) continue;
+      if (words.every((w, i) => sameWord(w, other[i]))) return existing;
+    }
+    return null;
+  };
+  // strongest first, so the surviving surface form is the dominant spelling
+  for (const c of [...cands].sort((a, b) => concentration(b) - concentration(a))) {
+    const hit = variantOf(c.key);
+    if (hit === null) {
+      best.set(c.key, { ...c, chunkIds: new Set(c.chunkIds) });
+      continue;
+    }
+    const prev = best.get(hit)!;
+    // label with the spelling the document actually uses most — "Dispatcher"
+    // over "Dispatch", not whichever variant happens to be shorter
+    if (c.count > prev.surfaceCount) {
+      prev.label = c.label;
+      prev.surfaceCount = c.count;
+    }
+    prev.count += c.count;
+    for (const id of c.chunkIds) prev.chunkIds.add(id);
+  }
+  return [...best.values()].sort((a, b) => concentration(b) - concentration(a));
+}
+
+/** True when a stronger pick already covers this phrase: it repeats one of
+ *  that phrase's words and lives almost entirely in the same chunks, so as a
+ *  node it would boost nothing new and only spend a slot. "trade secret law"
+ *  behind "trade secret" is the case this exists for — the bigram harvest
+ *  sees it as "secret law", which reads like a separate concept and is not
+ *  one. */
+function isEclipsedBy(c: Candidate, picked: Candidate[]): boolean {
+  const words = new Set(c.key.split(" "));
+  return picked.some((p) => {
+    if (!p.key.split(" ").some((w) => words.has(w))) return false;
+    let shared = 0;
+    for (const id of c.chunkIds) if (p.chunkIds.has(id)) shared++;
+    return shared / c.chunkIds.size >= 0.85;
+  });
+}
+
+const titleCase = (s: string) =>
+  s.replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
+
+// Eleven nodes, two thirds of them subject-matter phrases. A single merged
+// ranking would not do: concentration scores are much larger for phrases
+// (which recur far more often than any proper noun), so proper names —
+// "USPTO", "Federal Circuit" — would be shut out entirely and the
+// constellation would lose the concrete anchors that make it readable.
+const GRAPH_NODES = 11;
+const NAME_SLOTS = 4;
+
+export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
+  // a phrase must recur across a real slice of the document, not spike
+  // inside one worked example — concentration alone would rank a single
+  // case study's vocabulary above the document's actual themes
+  const minPhraseDf = Math.max(3, Math.round(chunks.length * 0.015));
+  const phrases = mergeVariants([...harvestPhrases(chunks).values()]).filter(
+    (c) => c.count >= 3 && c.chunkIds.size >= minPhraseDf,
+  );
+  const names = mergeVariants([...harvestNames(chunks).values()]).filter(
+    // df >= 2: a name confined to one chunk can form no edge, and at this
+    // end of the distribution single-chunk terms are almost all artifacts
+    // ("Whether" after a colon, a one-off case name)
+    (c) => c.count >= 2 && c.chunkIds.size >= 2,
+  );
+
+  // a name and a phrase can be the same entity ("United States"); the name's
+  // surface form wins and the phrase copy is dropped
+  const takenNames = names.slice(0, NAME_SLOTS);
+  const nameKeys = new Set(takenNames.map((c) => c.key));
+  const takenPhrases: Candidate[] = [];
+  for (const c of phrases) {
+    if (takenPhrases.length >= GRAPH_NODES - takenNames.length) break;
+    if (nameKeys.has(c.key)) continue;
+    if (isEclipsedBy(c, [...takenNames, ...takenPhrases])) continue;
+    takenPhrases.push(c);
+  }
+  const picked = [...takenNames, ...takenPhrases];
+  // whichever pool the document is short on, the other fills the gap
+  const pickedKeys = new Set(picked.map((c) => c.key));
+  for (const c of [...names, ...phrases]) {
+    if (picked.length >= GRAPH_NODES) break;
+    if (pickedKeys.has(c.key)) continue;
+    pickedKeys.add(c.key);
+    picked.push(c);
+  }
+  picked.sort((a, b) => concentration(b) - concentration(a));
+
+  const perChunk: string[][] = chunks.map((c) =>
+    picked.filter((p) => p.chunkIds.has(c.id)).map((p) => p.key),
+  );
 
   // golden-spiral placement on the unit sphere
-  const nodes: ExtractedEntity[] = topTerms.map(([label, v], i) => {
-    const n = topTerms.length;
+  const nodes: ExtractedEntity[] = picked.map((cand, i) => {
+    const n = picked.length;
     const y = n > 1 ? 1 - (i / (n - 1)) * 2 : 0;
     const r = Math.sqrt(Math.max(0, 1 - y * y));
     const th = i * 2.39996;
+    const label = /[A-Z]/.test(cand.label) ? cand.label : titleCase(cand.label);
     return {
       label: label.length > 16 ? label.slice(0, 15) + "…" : label,
       full: label,
-      count: v.count,
-      chunkIds: v.chunkIds,
+      count: cand.count,
+      chunkIds: cand.chunkIds,
       p: [Math.cos(th) * r, y * 0.85, Math.sin(th) * r] as [number, number, number],
-      desc: `${v.count} mentions across ${v.chunkIds.size} chunk${v.chunkIds.size > 1 ? "s" : ""} of this document.`,
+      desc: `${cand.count} mentions across ${cand.chunkIds.size} chunk${cand.chunkIds.size > 1 ? "s" : ""} of this document.`,
     };
   });
 
-  const index = new Map(topTerms.map(([label], i) => [label, i]));
+  const index = new Map(picked.map((c, i) => [c.key, i]));
   const pairCounts = new Map<string, number>();
   for (const terms of perChunk) {
     const ids = terms
@@ -942,17 +1158,15 @@ export function buildRealSources(
 // tokens that make a phrase useless as a question subject: site chrome,
 // citation abbreviations, textbook scaffolding
 const PHRASE_NOISE =
-  /\b(www|org|com|edu|net|http|https|html|pdf|isbn|openstax|access|free|page|pages|figure|table|chapter|section|appendix|index|contents|answer|key|credit|rule|rules|fed|civ|supp|cir|inc|llc|ibid|seq|stat|reg|vol|pub|press|review|journal|university|learning|objectives?|completing|question|questions|assessment)\b/;
+  /\b(www|org|com|edu|net|http|https|html|pdf|isbn|openstax|access|accessed|retrieved|wikimedia|commons|free|page|pages|figure|table|chapter|section|appendix|index|contents|answer|key|credit|rule|rules|fed|civ|supp|cir|inc|llc|ibid|seq|stat|reg|vol|pub|press|review|journal|university|learning|objectives?|completing|question|questions|assessment|examples?|default|defaults|returns|parameter|parameters|usage|deprecated)\b/;
 
-/** Distinct bigrams of content tokens per chunk → chunk-frequency map. */
+/** Chunk-frequency of each phrase the document actually contains. Shares
+ *  harvestPhrases with the entity graph so "a phrase" means one thing here
+ *  and there — a suggested question built from a URL path ("What is docs
+ *  docs?") has the same root cause as a graph node built from one. */
 function bigramDf(chunks: DocChunk[]): Map<string, number> {
   const df = new Map<string, number>();
-  for (const c of chunks) {
-    const t = tokenize(c.text);
-    const seen = new Set<string>();
-    for (let i = 0; i < t.length - 1; i++) seen.add(t[i] + " " + t[i + 1]);
-    for (const b of seen) df.set(b, (df.get(b) || 0) + 1);
-  }
+  for (const [label, c] of harvestPhrases(chunks)) df.set(label, c.chunkIds.size);
   return df;
 }
 

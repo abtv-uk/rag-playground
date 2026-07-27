@@ -173,6 +173,74 @@ export async function gradePassages(
   }
 }
 
+// ---------- query planning (agentic mode) ----------
+
+/** Same reasoning as GRADE_TIMEOUT_MS: planning precedes generation on the
+ *  serial path. Measured ~0.5-0.9s against the real Worker. */
+const PLAN_TIMEOUT_MS = 3500;
+
+export interface QueryPlan {
+  subqueries: string[];
+  rationale: string;
+}
+
+const normalizeQ = (s: string) => tokenizeWords(s).join(" ");
+function tokenizeWords(s: string): string[] {
+  return s.toLowerCase().match(/[a-z0-9]+/g) || [];
+}
+
+/** Sub-query decomposition for agentic mode. Null — never throws — on any
+ *  failure, and the caller falls back to the PRF refine loop that predates
+ *  this route.
+ *
+ *  Degeneracy is guarded here, client-side, because this is where the
+ *  fallback lives: a subquery that normalizes to the original question (or
+ *  to an earlier subquery) is dropped, and if nothing meaningful survives —
+ *  including the model's own explicit "no split needed" single-subquery
+ *  answer — the whole plan is treated as absent so PRF still runs, rather
+ *  than burning the second pass re-retrieving the original query verbatim. */
+export async function planQuery(
+  query: string,
+  signal: AbortSignal,
+): Promise<QueryPlan | null> {
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => ac.abort(), PLAN_TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT + "/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+      signal: ac.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data?.subqueries)) return null;
+
+    const seen = new Set<string>([normalizeQ(query)]);
+    const subqueries: string[] = [];
+    for (const s of data.subqueries) {
+      if (typeof s !== "string") continue;
+      const key = normalizeQ(s);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      subqueries.push(s.trim());
+      if (subqueries.length === 3) break;
+    }
+    if (!subqueries.length) return null;
+    return {
+      subqueries,
+      rationale: typeof data.rationale === "string" ? data.rationale.trim() : "",
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export interface HealthStatus {
   ok: boolean;
   workersAiAvailable: boolean;

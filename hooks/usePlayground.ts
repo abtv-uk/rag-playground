@@ -21,8 +21,8 @@ import {
   parseFile,
   type LoadedDoc,
 } from "@/lib/document";
-import { embedQuery, embedTexts } from "@/lib/embeddings";
-import { checkHealth, generateLlmAnswer, gradePassages } from "@/lib/llm";
+import { embedQuery, embedTexts, vectorAt } from "@/lib/embeddings";
+import { checkHealth, generateLlmAnswer, gradePassages, planQuery } from "@/lib/llm";
 import { PipelineRenderer } from "@/lib/renderer";
 import {
   applyGradeVerdicts,
@@ -33,6 +33,7 @@ import {
   retrieveBasic,
   retrieveCorrective,
   retrieveHybrid,
+  type AgenticPlanOpts,
   type CorrectivePass1,
 } from "@/lib/retrieval";
 import { applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
@@ -66,6 +67,11 @@ const INITIAL: PlaygroundState = {
 // interaction — much shorter than embedTexts' own per-document timeout,
 // since a query is one short string, not a whole document.
 const QUERY_EMBED_TIMEOUT_MS = 3000;
+
+// Agentic embeds the original query AND its sub-queries in one batched
+// /embed call (≤4 short strings — never one call per sub-query), so its
+// bound is slightly looser than the single-query one above.
+const AGENTIC_EMBED_TIMEOUT_MS = 4500;
 
 // How long to wait for generated prose before giving up and showing the
 // offline extractive answer instead. Workers AI's time-to-first-token is
@@ -284,6 +290,7 @@ export function usePlayground() {
       qsteps: ReturnType<typeof steps>,
       queryVec: Float32Array | null,
       pass1?: CorrectivePass1,
+      planOpts?: AgenticPlanOpts,
     ) => {
       const scene = renderer.view.scene;
       const denseOpts = doc.dense && queryVec ? { dense: doc.dense, queryVec } : undefined;
@@ -300,7 +307,9 @@ export function usePlayground() {
               // recomputes pass 1 itself and falls back to the cosine floor
               retrieveCorrective(doc.chunks, q, denseOpts, pass1)
             : rag === "agentic"
-              ? retrieveAgentic(doc.chunks, q, denseOpts)
+              ? // planOpts carries a validated /plan decomposition; absent,
+                // this falls back to the PRF refine loop
+                retrieveAgentic(doc.chunks, q, denseOpts, planOpts)
               : retrieveBasic(doc.chunks, q, denseOpts);
       applyQueryToScene(scene, res);
       const sources = buildRealSources(rag, res, scene);
@@ -421,6 +430,46 @@ export function usePlayground() {
       renderer.view.queryStart = performance.now();
 
       if (!doc) return;
+
+      // Agentic plans BEFORE embedding, because the decomposition decides
+      // what gets embedded: the original query and every sub-query go to
+      // /embed together as one batched call — never one call per
+      // sub-query. Serial cost is the plan call (~0.5-0.9s measured)
+      // ahead of the embed; both are bounded, and every failure along the
+      // way degrades to a working path (plan null → PRF refine loop;
+      // embed null → lexical-only retrieval, plan still applied).
+      if (rag === "agentic") {
+        const ac = new AbortController();
+        abortRef.current = ac;
+        set({ genPhase: "planning" });
+        planQuery(q, ac.signal).then(async (plan) => {
+          if (seq !== querySeqRef.current) return;
+          let queryVec: Float32Array | null = null;
+          let planOpts: AgenticPlanOpts | undefined = plan
+            ? { subqueries: plan.subqueries, rationale: plan.rationale }
+            : undefined;
+          if (doc.dense) {
+            set({ genPhase: "embedding" });
+            const idx = await Promise.race([
+              embedTexts([q, ...(plan?.subqueries ?? [])]),
+              new Promise<null>((resolve) =>
+                setTimeout(() => resolve(null), AGENTIC_EMBED_TIMEOUT_MS),
+              ),
+            ]);
+            if (seq !== querySeqRef.current) return;
+            if (idx) {
+              queryVec = vectorAt(idx, 0);
+              if (planOpts)
+                planOpts = {
+                  ...planOpts,
+                  subVecs: planOpts.subqueries.map((_, i) => vectorAt(idx, i + 1)),
+                };
+            }
+          }
+          runRetrieval(seq, q, doc, rag, qsteps, queryVec, undefined, planOpts);
+        });
+        return;
+      }
 
       // Query embedding is a network call, so it's the one part of
       // retrieval that isn't synchronous. It's fast (a few hundred ms for

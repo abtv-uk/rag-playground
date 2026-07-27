@@ -38,8 +38,14 @@ export interface BuiltPrompt {
 // identically to naive's, because nothing asks the model to use the
 // relationship the graph found. Appended only when concepts survive
 // filtering — an empty RELATED CONCEPTS line would be worse than none.
+// Phrased to hold for a single concept as well as several: the client
+// sends only entities whose own label matched the query, and on real
+// documents that is very often exactly one (measured across the bundled
+// sample's questions, each matches precisely its own subject). An earlier
+// wording asked only for "the relationship between them", which is
+// meaningless for a list of one.
 const CONCEPT_RULE =
-  '7. The RELATED CONCEPTS below are entities the knowledge graph linked to this question. Where the passages support it, make the relationship between them explicit rather than describing each separately. Never mention the concept list, the graph, or that you were given these terms.';
+  '7. The RELATED CONCEPTS below are entities the knowledge graph linked to this question. Where the passages support it, explain how the answer relates to each of them — and where there is more than one, make the relationship between them explicit rather than describing each separately. Never mention the concept list, the graph, or that you were given these terms.';
 
 export function buildAnswerPrompt(
   rag: RagId,

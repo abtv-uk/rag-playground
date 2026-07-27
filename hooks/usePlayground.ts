@@ -73,6 +73,41 @@ const QUERY_EMBED_TIMEOUT_MS = 3000;
 // bound is slightly looser than the single-query one above.
 const AGENTIC_EMBED_TIMEOUT_MS = 4500;
 
+// Quality bar on hybrid's RELATED CONCEPTS: send only entities whose OWN
+// label matched a query term, never the 1-hop graph neighbors that
+// graphBoosted also carries.
+//
+// Why: on the deployed site "What does it say about patent cases?" sent
+// ["Patents", "America", "Khan"] and the answer duly reorganized itself
+// around an America-vs-Britain historical contrast instead of patent-case
+// substance. None of that noise was a match — it arrived as neighbors of
+// "Patents". The neighbor hop is right for boosting *retrieval*
+// (co-occurrence points at relevant chunks) and wrong for steering *prose*,
+// which is exactly the distinction graphMatched draws.
+//
+// Improved entity extraction has since removed the worst offenders (Khan,
+// Wikimedia Commons, Retrieved) but NOT the geographic ones: for that same
+// query the neighbor set is still Patent System + America + United States,
+// so this gate still earns its place. Measured against the current
+// extraction, matched-only yields exactly the subject of each question —
+// Intellectual Property, Patent System, Trade Secret.
+//
+// Deliberately trades recall for precision: a genuinely useful neighbor
+// would be dropped too. Revisit if neighbors ever become trustworthy.
+//
+// Falls to undefined when a query names nothing the graph knows, which the
+// Worker treats as "omit the RELATED CONCEPTS line entirely" — an empty
+// list would be worse than none.
+function conceptsForPrompt(
+  res: { graphMatched?: number[] },
+  scene: { gnodes: { full?: string; label: string }[] },
+): string[] | undefined {
+  const labels = (res.graphMatched ?? [])
+    .map((gi) => scene.gnodes[gi]?.full || scene.gnodes[gi]?.label)
+    .filter((s): s is string => !!s);
+  return labels.length ? labels.slice(0, 6) : undefined;
+}
+
 // How long to wait for generated prose before giving up and showing the
 // offline extractive answer instead. Workers AI's time-to-first-token is
 // well under a second; Gemini (used for the sample) is both the slower
@@ -391,25 +426,11 @@ export function usePlayground() {
                 const c = chunkById.get(s.chunkId)!;
                 return { id: c.id, page: c.page, text: c.text };
               }),
-          // Hybrid: the entities the graph actually linked to this query —
-          // the same ones the trace cards surface — so the prose reflects
-          // the graph half of the retrieval instead of reading like naive's.
-          // Full labels, not the truncated display ones, since the Worker
-          // matches them against passage text.
-          //
-          // Still legitimately empty when a query names nothing the graph
-          // knows, and the Worker then omits the RELATED CONCEPTS line
-          // entirely — the correct degradation, since an empty concept list
-          // would be worse than none. It is no longer the normal case on the
-          // bundled sample: every one of its TRY questions now matches
-          // (extractEntityGraph used to return only proper nouns, so three
-          // of them matched nothing at all).
-          concepts:
-            rag === "hybrid"
-              ? (res.graphBoosted ?? [])
-                  .map((gi) => scene.gnodes[gi]?.full || scene.gnodes[gi]?.label)
-                  .filter((s): s is string => !!s)
-              : undefined,
+          // Hybrid: entities the graph linked to this query, so the prose
+          // reflects the graph half of the retrieval instead of reading
+          // like naive's. Full labels, not the truncated display ones,
+          // since the Worker matches them against passage text.
+          concepts: rag === "hybrid" ? conceptsForPrompt(res, scene) : undefined,
         },
         (delta) => {
           if (seq !== querySeqRef.current) return;

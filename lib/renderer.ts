@@ -277,7 +277,18 @@ export class PipelineRenderer {
     const W = this.W;
     const H = this.H;
     const rag = this.view.rag;
-    const vSub = this.view.scene.chunkCount + " chunks · 768-d";
+    // Reports what the two drawn axes actually capture once the scatter is
+    // a real projection. ~11% for 768-d embeddings is genuinely what two
+    // components explain — stating it is the point of showing real
+    // structure rather than a decorative cloud. Falls back to the plain
+    // dimension label while the layout is still the placeholder.
+    const proj = this.view.scene.proj;
+    const vSub = proj
+      ? this.view.scene.chunkCount +
+        " chunks · 768-d → 2-d PCA · " +
+        Math.round((proj.explained[0] + proj.explained[1]) * 100) +
+        "% var"
+      : this.view.scene.chunkCount + " chunks · 768-d";
     const pt = (x: number, y: number): Pt => ({ x, y });
     const N = (
       id: string,
@@ -660,6 +671,29 @@ export class PipelineRenderer {
       ctx.fillStyle = fill;
       ctx.fill();
     });
+
+    // The query itself, projected into the same basis as the dots — an open
+    // ring so it reads as a probe rather than another chunk. Watching it
+    // land inside the highlighted cluster is the most direct demonstration
+    // the scatter can give that retrieval is semantic: measured, it sits at
+    // ~0.3x the mean dot distance for an on-topic question and drifts to
+    // ~0.66x for an off-topic one. Only drawn once the dots have settled,
+    // so it doesn't race the fly-in animation.
+    const q = scene.queryDot;
+    if (q && o.highlightOn && settle > 0.9) {
+      const qp = this.pn(p, q.nx, q.ny);
+      const pulse = o.anim ? 0.5 + 0.5 * Math.sin(now / 380) : 0.6;
+      ctx.beginPath();
+      ctx.arc(qp.x, qp.y, 7.5 + pulse * 2.5, 0, 7);
+      ctx.strokeStyle = this.rgba(A, 0.32 + pulse * 0.25);
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(qp.x, qp.y, 3.2, 0, 7);
+      ctx.strokeStyle = A;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
     ctx.restore();
   }
 

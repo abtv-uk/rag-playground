@@ -36,7 +36,7 @@ import {
   type AgenticPlanOpts,
   type CorrectivePass1,
 } from "@/lib/retrieval";
-import { applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
+import { applyProjection, applyQueryToScene, buildScene, sampleScene } from "@/lib/scene";
 import { steps } from "@/lib/steps";
 import type { PlaygroundState, RagId } from "@/lib/types";
 
@@ -264,7 +264,13 @@ export function usePlayground() {
         ).then((dense) => {
           if (loadSeq !== loadSeqRef.current) return; // superseded by a newer load
           set({ embedProgress: null });
-          if (dense) doc.dense = dense;
+          if (dense) {
+            doc.dense = dense;
+            // Swap the placeholder scatter for the document's real semantic
+            // layout now that there are vectors to project. buildScene ran
+            // long before this, with nothing to work from.
+            applyProjection(renderer.view.scene, dense);
+          }
         });
       }
     },
@@ -346,7 +352,7 @@ export function usePlayground() {
                 // this falls back to the PRF refine loop
                 retrieveAgentic(doc.chunks, q, denseOpts, planOpts)
               : retrieveBasic(doc.chunks, q, denseOpts);
-      applyQueryToScene(scene, res);
+      applyQueryToScene(scene, res, queryVec);
       const sources = buildRealSources(rag, res, scene);
 
       // The generator must only ever be handed passages that have a

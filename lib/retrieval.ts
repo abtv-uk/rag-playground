@@ -878,22 +878,6 @@ function mergeVariants(cands: Candidate[]): Candidate[] {
   return [...best.values()].sort((a, b) => concentration(b) - concentration(a));
 }
 
-/** True when a stronger pick already covers this phrase: it repeats one of
- *  that phrase's words and lives almost entirely in the same chunks, so as a
- *  node it would boost nothing new and only spend a slot. "trade secret law"
- *  behind "trade secret" is the case this exists for — the bigram harvest
- *  sees it as "secret law", which reads like a separate concept and is not
- *  one. */
-function isEclipsedBy(c: Candidate, picked: Candidate[]): boolean {
-  const words = new Set(c.key.split(" "));
-  return picked.some((p) => {
-    if (!p.key.split(" ").some((w) => words.has(w))) return false;
-    let shared = 0;
-    for (const id of c.chunkIds) if (p.chunkIds.has(id)) shared++;
-    return shared / c.chunkIds.size >= 0.85;
-  });
-}
-
 const titleCase = (s: string) =>
   s.replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
 
@@ -924,15 +908,29 @@ export function extractEntityGraph(chunks: DocChunk[]): EntityGraph {
   // surface form wins and the phrase copy is dropped
   const takenNames = names.slice(0, NAME_SLOTS);
   const nameKeys = new Set(takenNames.map((c) => c.key));
+
+  // No word twice across the graph. Ranking alone gives every slot to the
+  // document's loudest subject — the sample spent three of eleven nodes on
+  // "patent system", "patent litigation" and "design patents" while
+  // copyright, which the book devotes a section to, got none at all. One
+  // node per subject word covers more of a document in the same eleven
+  // slots, and it subsumes the near-duplicate case too: "trade secret law"
+  // arrives from the bigram harvest as "secret law", which reads like a
+  // separate concept behind "trade secret" and is not one.
+  const spokenFor = new Set(takenNames.flatMap((c) => c.key.split(" ")));
   const takenPhrases: Candidate[] = [];
   for (const c of phrases) {
     if (takenPhrases.length >= GRAPH_NODES - takenNames.length) break;
     if (nameKeys.has(c.key)) continue;
-    if (isEclipsedBy(c, [...takenNames, ...takenPhrases])) continue;
+    const words = c.key.split(" ");
+    if (words.some((w) => spokenFor.has(w))) continue;
+    words.forEach((w) => spokenFor.add(w));
     takenPhrases.push(c);
   }
   const picked = [...takenNames, ...takenPhrases];
-  // whichever pool the document is short on, the other fills the gap
+  // A short document may not have eleven distinct subjects to name. Fill
+  // from whatever is left rather than ship a sparse graph — the word rule
+  // is a preference between candidates, not a floor on quality.
   const pickedKeys = new Set(picked.map((c) => c.key));
   for (const c of [...names, ...phrases]) {
     if (picked.length >= GRAPH_NODES) break;

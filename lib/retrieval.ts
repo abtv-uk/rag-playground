@@ -34,6 +34,23 @@ export function tokenize(s: string): string[] {
   );
 }
 
+/** Two words are the same term if they differ only by an inflectional
+ *  ending ("patent"/"patents", "file"/"filed"). This is the project's whole
+ *  stemmer, deliberately — the alternative, a bare `startsWith`, silently
+ *  conflates unrelated words that merely share a prefix.
+ *
+ *  Measured on the bundled sample, `startsWith` put trademark-only chunks in
+ *  4 of the top 6 for the query "trade", and copyright-only chunks in 6 of 6
+ *  for "copy". Multi-term queries hide this — a second term's idf drowns the
+ *  false matches out — which is why it went unnoticed until single-term
+ *  queries were tested directly. Recall cost of the stricter rule was one
+ *  chunk across the probe set, and that chunk was a bibliography line. */
+function sameWord(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [long, short] = a.length > b.length ? [a, b] : [b, a];
+  return short.length >= 4 && long.length - short.length <= 2 && long.startsWith(short);
+}
+
 export interface ScoredChunk {
   chunk: DocChunk;
   raw: number;
@@ -157,7 +174,7 @@ function scoreChunks(chunks: DocChunk[], terms: string[]): ScoredChunk[] {
       const t = tokens[i];
       let raw = 0;
       for (const q of terms) {
-        const tf = t.filter((w) => w === q || w.startsWith(q)).length;
+        const tf = t.filter((w) => sameWord(w, q)).length;
         if (tf) raw += (1 + Math.log(tf)) * idf(q);
       }
       raw /= Math.sqrt(t.length || 1);
@@ -345,16 +362,6 @@ export function retrieveBasic(
 export interface GraphForRetrieval {
   nodes: { full?: string; label: string; chunkIds?: Set<number> }[];
   neighbors: Record<number, Set<number>>;
-}
-
-/** Two words are the same term if they differ only by an inflectional
- *  ending ("patent"/"patents", "file"/"filed"). A bare prefix test is not
- *  enough here: the query "trade secret" would light up the entity
- *  "Trademark Office", because "trademark" starts with "trade". */
-function sameWord(a: string, b: string): boolean {
-  if (a === b) return true;
-  const [long, short] = a.length > b.length ? [a, b] : [b, a];
-  return short.length >= 4 && long.length - short.length <= 2 && long.startsWith(short);
 }
 
 export function retrieveHybrid(
@@ -659,7 +666,9 @@ function extractAnswer(top: ScoredChunk[], qTerms: string[]): string {
     for (const s of sentences(sc.chunk.text)) {
       const t = tokenize(s);
       let hits = 0;
-      for (const q of qTerms) if (t.some((w) => w === q || w.startsWith(q))) hits++;
+      // same stemming rule as scoreChunks — a sentence about trademarks is
+      // not "mentioning the query" for a trade-secret question
+      for (const q of qTerms) if (t.some((w) => sameWord(w, q))) hits++;
       if (!hits) continue; // only sentences that actually mention the query
       let score = hits / Math.sqrt(t.length || 1) + sc.score * 0.1;
       if (looksStructural(s)) score *= 0.15;

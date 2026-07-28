@@ -83,6 +83,12 @@ interface ThemeColors {
   track: string;
   dot: string;
   dotDim: string;
+  /** One tint per k-means cluster, used only once the scatter is a real
+   *  projection (scene.proj set). Deliberately low-saturation and close in
+   *  lightness to `dot`: these are 2.1px marks whose job is to make cluster
+   *  membership legible in aggregate, not to compete with the retrieved
+   *  chunk's accent. Length must cover the k used in scene.ts. */
+  clusterDots: string[];
   nodeStroke: string;
   pipeBase: string;
   shadow: string;
@@ -102,6 +108,16 @@ const TC_DARK: ThemeColors = {
   track: "rgba(255,255,255,0.10)",
   dot: "rgba(255,255,255,0.32)",
   dotDim: "rgba(255,255,255,0.16)",
+  // Hues spaced around the wheel, held near `dot`'s lightness so the cloud
+  // reads as one population; alpha slightly above `dot` because hue at 2.1px
+  // needs the extra weight to register at all.
+  clusterDots: [
+    "hsla(212,55%,72%,0.42)",
+    "hsla(272,45%,74%,0.42)",
+    "hsla(152,42%,66%,0.40)",
+    "hsla(38,60%,68%,0.42)",
+    "hsla(348,50%,72%,0.40)",
+  ],
   nodeStroke: "rgba(255,255,255,0.30)",
   pipeBase: "rgba(255,255,255,0.20)",
   shadow: "rgba(0,0,0,0.55)",
@@ -121,6 +137,15 @@ const TC_LIGHT: ThemeColors = {
   track: "rgba(17,21,27,0.07)",
   dot: "rgba(17,21,27,0.22)",
   dotDim: "rgba(17,21,27,0.16)",
+  // Same hues, darkened rather than lightened — on white the tint has to
+  // sit below the background to read, which is the mirror of the dark theme.
+  clusterDots: [
+    "hsla(212,55%,38%,0.32)",
+    "hsla(272,40%,42%,0.32)",
+    "hsla(152,45%,30%,0.30)",
+    "hsla(38,70%,34%,0.32)",
+    "hsla(348,50%,40%,0.30)",
+  ],
   nodeStroke: "rgba(17,21,27,0.30)",
   pipeBase: "rgba(17,21,27,0.17)",
   shadow: "rgba(17,21,27,0.20)",
@@ -655,7 +680,15 @@ export class PipelineRenderer {
       const y = src.y + (tp.y - src.y) * t;
       const isRel = rel.has(c.idx);
       let R = 2.1;
-      let fill = T.dot;
+      // Precedence, most specific last — each line is allowed to overwrite
+      // the one above, which is what keeps the constraints structural:
+      //   1. cluster tint only when `proj` exists, so the pre-embedding
+      //      placeholder layout (page % 5 + PRNG) stays honestly neutral —
+      //      it has no semantic clusters to colour
+      //   2. the dimmed state stays neutral, so the scatter recedes as
+      //      intended while other pipeline stages animate
+      //   3. a retrieved chunk always wins with the mode accent + halo
+      let fill = scene.proj ? T.clusterDots[c.cl % T.clusterDots.length] : T.dot;
       if (o.active && !o.highlightOn) fill = T.dotDim;
       if (isRel) {
         R = 3.6;

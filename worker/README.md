@@ -17,7 +17,44 @@ API key server-side, which is what this Worker is for.
 | Route | Purpose |
 |---|---|
 | `GET /health` | `{ok, workersAi:{tier,model}, gemini:{tier,model}}` — checked once by the client at mount |
+| `POST /embed` | `{texts}` → int8-quantized 768-d vectors, in the binary `vectors.bin` wire format below |
+| `POST /grade` | `{query, doc, chunks}` → `{verdicts:[{i, relevant, why}]}` — real relevance verdicts for corrective mode |
+| `POST /plan` | `{query}` → `{subqueries, rationale}` — sub-query decomposition for agentic mode |
 | `POST /generate` | SSE stream of `{"type":"delta"\|"done"\|"error", ...}` frames |
+
+### `POST /embed` — wire format
+
+One binary body, shared byte-for-byte with the precomputed sample sidecar
+(`public/sample/*.vectors.bin`) so a single client decoder handles both:
+
+```
+[4 bytes]      uint32 LE — header byte length H
+[H bytes]      UTF-8 JSON {"dim":768,"count":N,"scales":[N floats]}
+[N*dim bytes]  Int8Array, row-major, one row per input text
+```
+
+Dequantization is **`v = q * scale`** — the ÷127 is already baked into each
+scale at encode time. Dividing again yields vectors of norm ~0.007 instead
+of ~1, which degrades retrieval silently rather than failing. Per-vector
+scales (not one shared scale) cost a few bytes and recover most of the int8
+recall loss. `tests/embeddings-wire.test.ts` pins all of this.
+
+### `POST /grade` and `POST /plan` — the auxiliary calls
+
+Both run on `AUX_MODEL` (see `src/budget.ts`) and both degrade to null on
+any failure, so the client falls back to the behaviour that predates them.
+
+`/grade` sends **one passage per call, in parallel** rather than batching.
+This is deliberate and measured: asked to grade five passages in one call,
+the model returned two verdicts and stopped — not truncation, it simply
+declined to enumerate. Per-passage calls make the count structural.
+
+Neither route increments the per-IP daily counter; only `/generate` does.
+They are the first half of one logical question, and charging a visitor
+twice would halve corrective and agentic mode's daily allowance.
+
+`/plan` receives the query text only — never document content — so it
+raises no provider-routing question at all.
 
 ## Provider routing (the trust boundary)
 

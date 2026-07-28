@@ -26,6 +26,7 @@ import {
   workersAiTier,
 } from "./budget";
 import type { Env } from "./env";
+import { logRequest, logUpstreamError, type RequestLog } from "./log";
 import {
   buildAnswerPrompt,
   buildGradePrompt,
@@ -159,6 +160,7 @@ async function handleGenerate(
   env: Env,
   ctx: ExecutionContext,
   origin: string | null,
+  log: RequestLog,
 ): Promise<Response> {
   const raw = await req.text();
   if (raw.length > MAX_BODY_BYTES) return json(413, { error: "request too large" }, origin);
@@ -178,17 +180,25 @@ async function handleGenerate(
   }
   const query = body.query.slice(0, MAX_QUERY_CHARS).trim();
   if (!query) return json(400, { error: "empty query" }, origin);
+  log.query = query;
 
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const { success } = await env.GENERATE_LIMITER.limit({ key: ip });
-  if (!success) return json(429, { error: "rate limited" }, origin);
+  if (!success) {
+    log.reason = "per-minute rate limit";
+    return json(429, { error: "rate limited" }, origin);
+  }
 
   const ipHash = await hashIp(ip, env.IP_HASH_SALT);
   const withinDaily = await checkAndIncrementIpDaily(env.RATE, ipHash);
-  if (!withinDaily) return json(429, { error: "daily limit reached" }, origin);
+  if (!withinDaily) {
+    log.reason = "per-IP daily limit";
+    return json(429, { error: "daily limit reached" }, origin);
+  }
 
   const { passages, provider } = resolvePassages(body);
   if (!passages.length) return json(400, { error: "no resolvable passages" }, origin);
+  log.n = passages.length;
 
   const prompt = buildAnswerPrompt(
     body.rag as RagId,
@@ -202,6 +212,8 @@ async function handleGenerate(
     if (tier !== "exhausted") {
       const stream = await connectGemini(env, tier, prompt);
       if (stream) {
+        log.provider = "gemini";
+        log.tier = tier;
         // Only a real successful connection counts against the daily
         // ladder — a live 429 from Google's own rate limit shouldn't burn
         // through our 200-calls budget for a request that produced no
@@ -212,14 +224,26 @@ async function handleGenerate(
       }
       // Gemini's connection failed (its own rate limit, a 5xx, a network
       // error) — fall through to Workers AI rather than surfacing a
-      // transient upstream error to the client.
+      // transient upstream error to the client. Recorded because this
+      // fallback is otherwise invisible: the client still gets an answer,
+      // so nothing surfaces that Gemini is failing.
+      log.reason = "gemini connect failed, fell back";
+    } else {
+      // Gemini's daily allowance is spent — same fall-through, different
+      // reason: neither should fail the sample path outright.
+      log.reason = "gemini quota exhausted, fell back";
     }
-    // Gemini's daily allowance is spent — same fall-through, different
-    // reason: neither should fail the sample path outright.
   }
 
   const wTier = await workersAiTier(env.QUOTA);
-  if (wTier === "exhausted") return json(503, { error: "quota exhausted" }, origin);
+  if (wTier === "exhausted") {
+    log.provider = "none";
+    log.tier = wTier;
+    log.reason = "workers-ai quota exhausted";
+    return json(503, { error: "quota exhausted" }, origin);
+  }
+  log.provider = "workers-ai";
+  log.tier = wTier;
   return new Response(streamWorkersAi(env, ctx, wTier, prompt), { headers: sseHeaders(origin) });
 }
 
@@ -237,6 +261,7 @@ async function handleEmbed(
   env: Env,
   ctx: ExecutionContext,
   origin: string | null,
+  log: RequestLog,
 ): Promise<Response> {
   const raw = await req.text();
   if (raw.length > MAX_EMBED_BODY_BYTES)
@@ -260,17 +285,27 @@ async function handleEmbed(
   if (!success) return json(429, { error: "rate limited" }, origin);
 
   const wTier = await workersAiTier(env.QUOTA);
-  if (wTier === "exhausted") return json(503, { error: "quota exhausted" }, origin);
+  if (wTier === "exhausted") {
+    log.tier = wTier;
+    log.reason = "workers-ai quota exhausted";
+    return json(503, { error: "quota exhausted" }, origin);
+  }
+  log.tier = wTier;
+  log.n = texts.length;
 
   let result: { data: number[][]; usage?: { prompt_tokens?: number } };
   try {
     result = (await env.AI.run(EMBED_MODEL, { text: texts })) as unknown as typeof result;
   } catch (err) {
+    logUpstreamError("/embed", EMBED_MODEL, err);
+    log.reason = "embedding call failed";
     return json(502, { error: err instanceof Error ? err.message : "embedding failed" }, origin);
   }
   const vectors = result.data;
-  if (!Array.isArray(vectors) || !vectors.length)
+  if (!Array.isArray(vectors) || !vectors.length) {
+    log.reason = "empty embedding response";
     return json(502, { error: "empty embedding response" }, origin);
+  }
   const dim = vectors[0].length;
 
   const promptTokens = result.usage?.prompt_tokens ?? texts.length * 60; // rough fallback estimate
@@ -322,6 +357,7 @@ async function handleGrade(
   env: Env,
   ctx: ExecutionContext,
   origin: string | null,
+  log: RequestLog,
 ): Promise<Response> {
   const raw = await req.text();
   if (raw.length > MAX_BODY_BYTES) return json(413, { error: "request too large" }, origin);
@@ -337,10 +373,14 @@ async function handleGrade(
   }
   const query = body.query.slice(0, MAX_QUERY_CHARS).trim();
   if (!query) return json(400, { error: "empty query" }, origin);
+  log.query = query;
 
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const { success } = await env.GENERATE_LIMITER.limit({ key: ip });
-  if (!success) return json(429, { error: "rate limited" }, origin);
+  if (!success) {
+    log.reason = "per-minute rate limit";
+    return json(429, { error: "rate limited" }, origin);
+  }
 
   const { passages } = resolvePassages(body as GenerateRequestBody);
   if (!passages.length) return json(400, { error: "no resolvable passages" }, origin);
@@ -353,7 +393,12 @@ async function handleGrade(
   }));
 
   const wTier = await workersAiTier(env.QUOTA);
-  if (wTier === "exhausted") return json(503, { error: "quota exhausted" }, origin);
+  if (wTier === "exhausted") {
+    log.tier = wTier;
+    log.reason = "workers-ai quota exhausted";
+    return json(503, { error: "quota exhausted" }, origin);
+  }
+  log.tier = wTier;
 
   // One call per passage, in parallel — see buildGradePrompt's note for the
   // measurements behind that. Wall-clock is one call's latency, not five.
@@ -383,7 +428,14 @@ async function handleGrade(
   // being silently rejected. Only a total washout is worth failing — that
   // means the grader is down, not merely fussy.
   if (!verdicts.length) {
+    log.reason = "grader returned no usable verdicts";
     return json(502, { error: "grader returned no usable verdicts" }, origin);
+  }
+  // Partial grades are legitimate but worth seeing: a persistent gap
+  // between requested and returned means the aux model is degrading.
+  log.n = verdicts.length;
+  if (verdicts.length !== graded.length) {
+    log.reason = `partial grade ${verdicts.length}/${graded.length}`;
   }
   return json(200, { verdicts }, origin);
 }
@@ -404,6 +456,7 @@ async function handlePlan(
   env: Env,
   ctx: ExecutionContext,
   origin: string | null,
+  log: RequestLog,
 ): Promise<Response> {
   const raw = await req.text();
   if (raw.length > MAX_BODY_BYTES) return json(413, { error: "request too large" }, origin);
@@ -419,16 +472,26 @@ async function handlePlan(
   }
   const query = body.query.slice(0, MAX_QUERY_CHARS).trim();
   if (!query) return json(400, { error: "empty query" }, origin);
+  log.query = query;
 
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const { success } = await env.GENERATE_LIMITER.limit({ key: ip });
-  if (!success) return json(429, { error: "rate limited" }, origin);
+  if (!success) {
+    log.reason = "per-minute rate limit";
+    return json(429, { error: "rate limited" }, origin);
+  }
 
   const wTier = await workersAiTier(env.QUOTA);
-  if (wTier === "exhausted") return json(503, { error: "quota exhausted" }, origin);
+  if (wTier === "exhausted") {
+    log.tier = wTier;
+    log.reason = "workers-ai quota exhausted";
+    return json(503, { error: "quota exhausted" }, origin);
+  }
+  log.tier = wTier;
 
   const parsed = await runAuxJson(env, ctx, buildPlanPrompt(query));
   if (!parsed || typeof parsed !== "object") {
+    log.reason = "planner returned nothing parseable";
     return json(502, { error: "planner returned no usable plan" }, origin);
   }
   const o = parsed as Record<string, unknown>;
@@ -440,8 +503,10 @@ async function handlePlan(
     .map((s) => s.trim().slice(0, MAX_QUERY_CHARS))
     .slice(0, MAX_PLAN_SUBQUERIES);
   if (!subqueries.length) {
+    log.reason = "planner returned no usable subqueries";
     return json(502, { error: "planner returned no usable plan" }, origin);
   }
+  log.n = subqueries.length;
   const rationale =
     typeof o.rationale === "string" ? o.rationale.slice(0, 120).trim() : "";
   return json(200, { subqueries, rationale }, origin);
@@ -462,6 +527,7 @@ async function handleHealth(env: Env, origin: string | null): Promise<Response> 
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const startedAt = Date.now();
     const url = new URL(req.url);
     const origin = corsOrigin(env, req);
 
@@ -487,21 +553,33 @@ export default {
       return new Response("origin not allowed", { status: 403 });
     }
 
+    // One structured line per request, emitted here rather than in each
+    // handler so every route is covered by construction and the fields stay
+    // consistent. Handlers enrich `log` as they make decisions — which
+    // provider served the request, which ladder tier, why a fallback fired.
+    //
+    // For /generate the elapsed time is time-to-response, not time-to-last
+    // token: the body is an SSE stream that outlives this function. That is
+    // the more useful number anyway (it is what the client's deadline races
+    // against), but it is not total generation time.
+    const log: RequestLog = { route: url.pathname, status: 0, ms: 0 };
+    let res: Response;
     if (req.method === "GET" && url.pathname === "/health") {
-      return handleHealth(env, origin);
+      res = await handleHealth(env, origin);
+    } else if (req.method === "POST" && url.pathname === "/embed") {
+      res = await handleEmbed(req, env, ctx, origin, log);
+    } else if (req.method === "POST" && url.pathname === "/grade") {
+      res = await handleGrade(req, env, ctx, origin, log);
+    } else if (req.method === "POST" && url.pathname === "/plan") {
+      res = await handlePlan(req, env, ctx, origin, log);
+    } else if (req.method === "POST" && url.pathname === "/generate") {
+      res = await handleGenerate(req, env, ctx, origin, log);
+    } else {
+      res = json(404, { error: "not found" }, origin);
     }
-    if (req.method === "POST" && url.pathname === "/embed") {
-      return handleEmbed(req, env, ctx, origin);
-    }
-    if (req.method === "POST" && url.pathname === "/grade") {
-      return handleGrade(req, env, ctx, origin);
-    }
-    if (req.method === "POST" && url.pathname === "/plan") {
-      return handlePlan(req, env, ctx, origin);
-    }
-    if (req.method === "POST" && url.pathname === "/generate") {
-      return handleGenerate(req, env, ctx, origin);
-    }
-    return json(404, { error: "not found" }, origin);
+    log.status = res.status;
+    log.ms = Date.now() - startedAt;
+    logRequest(log);
+    return res;
   },
 };

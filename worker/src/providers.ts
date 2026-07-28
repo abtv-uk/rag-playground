@@ -11,6 +11,7 @@ import {
 } from "./budget";
 import type { Env } from "./env";
 import type { BuiltPrompt } from "./prompts";
+import { logUpstreamError } from "./log";
 import { frame, readUpstreamSseData } from "./sse";
 
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -166,7 +167,11 @@ export async function runAuxJson(
       // extractJson fallback plus per-field validation downstream.
       response_format: { type: "json_object" },
     } as never);
-  } catch {
+  } catch (err) {
+    // Silent null is the contract callers rely on, but a persistently
+    // failing aux model would otherwise be invisible — every mode simply
+    // degrades to its non-LLM path and still answers.
+    logUpstreamError("aux", AUX_MODEL, err);
     return null;
   }
 
@@ -218,10 +223,15 @@ export async function connectGemini(
         }),
       },
     );
-  } catch {
+  } catch (err) {
+    logUpstreamError("/generate", `gemini:${model}`, err);
     return null; // network failure reaching Gemini at all
   }
-  if (!res.ok || !res.body) return null; // e.g. the 429 above — not our daily quota, Google's own
+  if (!res.ok || !res.body) {
+    // e.g. the 429 above — Google's own per-minute cap, not our daily quota
+    logUpstreamError("/generate", `gemini:${model}`, `HTTP ${res.status}`);
+    return null;
+  }
   return toWireStream(res.body);
 }
 

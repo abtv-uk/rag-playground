@@ -6,7 +6,13 @@
 
   // Text generation for uploaded documents (no training-data clause on
   // Workers AI, unlike Gemini's free tier — see src/sample.ts).
-  "ai": { "binding": "AI" },
+  //
+  // `remote: true` states what was already true: there is no local
+  // emulation of Workers AI, so `wrangler dev` calls the real service and
+  // draws real neurons from the shared daily budget. Saying so explicitly
+  // silences wrangler's warning and makes the cost of local testing
+  // obvious at the point where someone would otherwise assume it is free.
+  "ai": { "binding": "AI", "remote": true },
 
   "kv_namespaces": [
     // daily neuron/call counters for both providers — see src/budget.ts
@@ -30,7 +36,12 @@
     "ALLOWED_ORIGINS": "https://abtv-uk.github.io,http://localhost:3100,http://localhost:3000"
   },
 
-  "observability": { "enabled": true }
+  // head_sampling_rate 1 = keep every invocation. This Worker handles a
+  // demo's traffic, bounded above by the per-minute rate limit and the
+  // daily ceilings, so there is no volume argument for sampling — and a
+  // sampled-out request is exactly the one you want when chasing a
+  // provider fallback that only fires occasionally.
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
 
   // Secrets (never in this file): GEMINI_API_KEY, IP_HASH_SALT.
   // Local dev reads them from worker/.dev.vars (gitignored).

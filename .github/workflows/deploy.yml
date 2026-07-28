@@ -1,25 +1,68 @@
-name: Deploy to GitHub Pages
+# One workflow, not two: the point of this file is that `needs:` makes the
+# gate *structural* — main cannot deploy without the checks having passed.
+# A separate ci.yml could only ever run alongside the deploy, never in
+# front of it.
+name: CI & Deploy
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
+# Least privilege by default; only the deploy job is granted the Pages
+# tokens it actually needs.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# Per-ref, so a second push to a branch supersedes the first. Deploy
+# serialization is handled separately on that job — a `pages` group here
+# would let PR runs and main deploys cancel each other.
 concurrency:
-  group: pages
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # The committed measurement oracles (tests/). Offline and
+      # deterministic — the Worker-dependent probes under scripts/probes/
+      # are deliberately NOT run here: they need a live Worker and draw
+      # real Workers AI quota.
+      - run: npm test
+
+  # Separate job so it runs in parallel with the app checks, and so a
+  # Worker-only type error is legible as such. worker/ is its own
+  # TypeScript project (excluded from the root tsconfig) and its typecheck
+  # script previously existed without anything ever invoking it.
+  worker-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
+        working-directory: worker
+      - run: npm run typecheck
+        working-directory: worker
+
+  build:
+    needs: [checks, worker-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -29,18 +72,38 @@ jobs:
           GITHUB_PAGES: "true"
           # The generation Worker (worker/) is deployed independently via
           # `wrangler deploy`, not by this workflow — see worker/README.md.
-          # This only wires the client to its already-deployed URL.
+          # This only wires the client to its already-deployed URL. Public
+          # URL, not a secret, so fork PRs build fine without repo secrets.
           NEXT_PUBLIC_LLM_ENDPOINT: "https://rag-playground-worker.abdulbosit-melikuziev.workers.dev"
-      - uses: actions/upload-pages-artifact@v3
+      # PRs still run the full static export above — only the artifact
+      # upload is skipped, since nothing will consume it.
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: out
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    # Serialize deploys against each other without cancelling one midway —
+    # a half-applied Pages deployment is worse than a queued one.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        # v5 pairs with upload-pages-artifact@v5 (which moved to
+        # upload-artifact v7 — mixing majors risks a format mismatch).
+        #
+        # Every action here is pinned to a Node 24 major. Bumping
+        # deploy-pages alone was not enough: a run with checkout@v4 /
+        # setup-node@v4 still emitted the Node 20 deprecation warning,
+        # because the runner reports it per-action.
+        uses: actions/deploy-pages@v5

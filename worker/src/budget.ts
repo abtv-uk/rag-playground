@@ -5,9 +5,27 @@
 // outright — never billing, and giving the client a clean signal to
 // degrade to the extractive answer.
 //
-// KV read-then-write is not atomic, so concurrent requests can race past a
-// ceiling by a small margin. Acceptable for a free demo's scale; a Durable
-// Object would close the race if this ever needed to be exact.
+// KV read-then-write is not atomic, and KV reads are additionally
+// eventually consistent across regions — so these counters can undercount
+// under concurrent or geographically spread traffic, letting a request or
+// two past a ceiling.
+//
+// That is deliberate, not unexamined. This ladder is NOT what keeps the
+// Worker free: the Workers Free plan itself fails requests past its daily
+// neuron allocation rather than billing for them. The ladder's job is to
+// degrade *gracefully* — downshift to a cheaper model, then refuse with a
+// clean signal the client can fall back on — before traffic hits that hard
+// platform wall. The ceilings below sit well under the platform limit
+// precisely so a small overshoot is absorbed by the margin.
+//
+// A SQLite-backed Durable Object would make the count exact and is free-
+// plan eligible. It was considered and rejected: it puts a round-trip on
+// every request's critical path (/grade and /plan already sit in front of
+// generation, where latency is the scarce resource), and it introduces a
+// second free-tier ceiling — DO compute — that can itself start failing.
+// Trading a bounded, harmless overshoot for a new failure mode on the hot
+// path is a bad deal at this scale. Revisit if traffic ever makes the
+// overshoot material rather than theoretical.
 
 export type WorkersAiTier = "primary" | "downshift" | "exhausted";
 export type GeminiTier = "flash" | "flash-lite" | "exhausted";

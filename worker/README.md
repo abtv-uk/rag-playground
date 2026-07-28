@@ -117,8 +117,56 @@ local dev — just run `npm run dev:llm` from the repo root, which is this
 same `npm run dev` under the hood.
 
 `env.AI` (Workers AI) always hits the real remote service, even in local
-dev — see the `remote` mode noted in wrangler's own binding summary — so
-local testing against Llama does draw from the real daily quota.
+dev — the binding is declared `remote: true` in `wrangler.jsonc` to state
+that outright — so local testing against Llama draws from the real daily
+quota. The opt-in probe at `../scripts/probes/worker-live.mts` exercises
+`/health`, `/grade`, `/plan` and `/embed` against a running Worker and is
+the fastest way to confirm the LLM routes still behave:
+
+```sh
+node ../scripts/probes/worker-live.mts
+```
+
+After changing bindings in `wrangler.jsonc`, regenerate the types:
+
+```sh
+npm run types      # writes worker-configuration.d.ts
+```
+
+`src/env.ts` re-exports the generated `Cloudflare.Env` rather than
+restating the bindings, so a binding added to the config but forgotten in
+the type — or vice versa — surfaces as a type error. CI typechecks against
+the committed file.
+
+## Observability
+
+`observability` is enabled with `head_sampling_rate: 1` (keep everything —
+this Worker's volume is bounded by the rate limiter and the daily ladders,
+and a sampled-out request is exactly the one you want when chasing an
+intermittent fallback).
+
+Every request emits one structured JSON line: `route`, `status`, `ms`,
+plus `provider` and `tier` once chosen, `reason` when a fallback or refusal
+happened, and `n` for passage/subquery/verdict counts. Upstream failures
+log separately with `upstream` and `error` so they can be filtered without
+parsing every line.
+
+This matters most for the failures that are *invisible from the outside*.
+When Gemini returns a 503 the client still receives a perfectly good
+answer — the Worker falls through to Workers AI within the same request —
+so nothing surfaces that the preferred provider is down. That now shows up
+as a pair of lines:
+
+```json
+{"route":"/generate","upstream":"gemini:gemini-3.5-flash","error":"HTTP 503"}
+{"route":"/generate","status":200,"ms":270,"reason":"gemini connect failed, fell back","provider":"workers-ai","tier":"primary"}
+```
+
+**Not logged:** passage or chunk text. Uploaded documents are private —
+the provider-routing boundary above exists to keep them from a provider
+that trains on inputs, and writing them to logs would undo that from the
+other end. The user's `query` is recorded (truncated to 120 characters),
+since it is what makes a bad answer diagnosable.
 
 ## Deploying
 

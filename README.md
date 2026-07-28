@@ -1,6 +1,12 @@
 # RAG Playground
 
+[![CI & Deploy](https://github.com/abtv-uk/rag-playground/actions/workflows/deploy.yml/badge.svg)](https://github.com/abtv-uk/rag-playground/actions/workflows/deploy.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Live demo](https://img.shields.io/badge/live%20demo-abtv--uk.github.io-2BB673)](https://abtv-uk.github.io/rag-playground/)
+
 **Live demo → https://abtv-uk.github.io/rag-playground/**
+
+![RAG Playground in Hybrid mode: the bundled 400-chunk sample indexed, with the vector scatter coloured by k-means cluster and the knowledge graph beside it](public/screenshot.png)
 
 An interactive, single-screen playground for exploring how four retrieval-augmented generation (RAG) architectures answer the same question over the same document.
 
@@ -133,3 +139,11 @@ Every document — the bundled sample included — runs the same real pipeline. 
 ## Provenance
 
 This app is a high-fidelity recreation of a design prototype produced with Claude Design, ported to Next.js from a single-file HTML/canvas handoff.
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+Built by Abdul-Basit Melik · [GitHub](https://github.com/abtv-uk) · [LinkedIn](https://www.linkedin.com/in/ab-melik/)

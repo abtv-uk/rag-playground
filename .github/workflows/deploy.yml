@@ -26,8 +26,8 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -46,8 +46,8 @@ jobs:
   worker-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -61,8 +61,8 @@ jobs:
     needs: [checks, worker-checks]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -99,6 +99,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        # v5 pairs with upload-pages-artifact@v5 and runs on Node 24 —
-        # v4 was the source of the Node 20 deprecation warning.
+        # v5 pairs with upload-pages-artifact@v5 (which moved to
+        # upload-artifact v7 — mixing majors risks a format mismatch).
+        #
+        # Every action here is pinned to a Node 24 major. Bumping
+        # deploy-pages alone was not enough: a run with checkout@v4 /
+        # setup-node@v4 still emitted the Node 20 deprecation warning,
+        # because the runner reports it per-action.
         uses: actions/deploy-pages@v5
